@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PingTunnel Manager</title>
+<style>
+:root {
+  --bg:#f1f5f9; --surface:#fff; --primary:#3b82f6; --primary-hover:#2563eb;
+  --danger:#ef4444; --danger-hover:#dc2626; --success:#10b981;
+  --text:#0f172a; --muted:#64748b; --border:#e2e8f0;
+  --shadow:0 1px 3px rgba(0,0,0,.1); --radius:8px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
+.container{max-width:960px;margin:0 auto;padding:24px}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+header h1{font-size:22px;font-weight:700}
+header h1 em{font-style:normal;color:var(--primary)}
+.header-acts{display:flex;align-items:center;gap:8px}
+.btn-lang{font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:6px;
+  background:var(--surface);cursor:pointer;color:var(--muted);font-weight:500}
+.btn-lang:hover{border-color:var(--primary);color:var(--primary)}
+.btn-logout{font-size:12px;padding:4px 12px;border:1px solid var(--border);border-radius:6px;
+  background:var(--surface);cursor:pointer;color:var(--muted)}
+.btn-logout:hover{background:#fef2f2;color:var(--danger);border-color:var(--danger)}
+
+.login-wrap{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px}
+.login-box{background:var(--surface);border-radius:12px;padding:40px 36px;width:380px;max-width:100%;
+  box-shadow:0 8px 30px rgba(0,0,0,.08)}
+.login-box h1{text-align:center;font-size:24px;margin-bottom:4px}
+.login-box h1 em{font-style:normal;color:var(--primary)}
+.login-sub{text-align:center;font-size:13px;color:var(--muted);margin-bottom:28px}
+.login-err{color:var(--danger);font-size:13px;margin-top:8px;text-align:center;min-height:20px}
+.login-lang{position:absolute;top:20px;right:24px}
+
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:28px}
+.stat{background:var(--surface);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
+.stat-label{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:600}
+.stat-val{font-size:26px;font-weight:700;margin-top:2px}
+
+.section-hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.section-hd h2{font-size:16px;font-weight:600}
+
+.btn{display:inline-flex;align-items:center;gap:5px;padding:8px 16px;border:none;border-radius:6px;
+  font-size:13px;font-weight:500;cursor:pointer;transition:background .15s}
+.btn-p{background:var(--primary);color:#fff}.btn-p:hover{background:var(--primary-hover)}
+.btn-d{background:var(--danger);color:#fff}.btn-d:hover{background:var(--danger-hover)}
+.btn-g{background:transparent;color:var(--muted);padding:4px}.btn-g:hover{color:var(--danger)}
+.btn-s{padding:4px 10px;font-size:12px}
+.btn-o{background:var(--bg);color:var(--text)}.btn-o:hover{background:var(--border)}
+
+.card{background:var(--surface);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:16px;overflow:hidden}
+.card-hd{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border)}
+.card-hd .name{font-weight:600;font-size:15px}
+.card-hd code{font-family:'SF Mono',Consolas,monospace;font-size:13px;color:var(--muted);background:#f8fafc;
+  padding:2px 8px;border-radius:4px;margin-left:10px}
+.card-hd .acts{display:flex;gap:8px;align-items:center}
+
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
+  font-weight:600;padding:10px 20px;border-bottom:1px solid var(--border)}
+td{padding:10px 20px;font-size:14px;border-bottom:1px solid #f8fafc}
+tr:last-child td{border-bottom:none}
+td code{font-family:'SF Mono',Consolas,monospace;font-size:13px}
+
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}
+.badge-on{background:#dcfce7;color:#166534}
+.badge-off{background:#f1f5f9;color:var(--muted)}
+
+.add-row{display:flex;align-items:center;gap:8px;padding:12px 20px;background:#fafbfc;border-top:1px solid var(--border)}
+.add-row input{flex:1;padding:6px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none}
+.add-row input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
+
+.empty{text-align:center;padding:40px 20px;color:var(--muted);font-size:14px}
+.hint{font-size:12px;color:var(--muted);text-align:center;padding:14px 20px}
+
+.card-traffic{display:flex;align-items:center;gap:20px;padding:10px 20px;font-size:12px;color:var(--muted);
+  border-bottom:1px solid var(--border);background:#fafbfc}
+.card-traffic .spd{display:flex;align-items:center;gap:4px}
+.card-traffic .arrow{font-size:14px;line-height:1}
+.card-traffic .arrow.up{color:#f59e0b}
+.card-traffic .arrow.dn{color:var(--primary)}
+.card-traffic .val{font-weight:700;color:var(--text);font-family:'SF Mono',Consolas,monospace;font-size:12px}
+.card-traffic .sep{width:1px;height:16px;background:var(--border)}
+.card-traffic .total-lbl{font-weight:600;margin-right:4px}
+
+.cmd-row{padding:0 20px 8px;background:#f8fafc}
+.cmd-box{display:flex;align-items:center;gap:6px;padding:6px 10px;background:#1e293b;border-radius:6px}
+.cmd-box code{flex:1;font-family:'SF Mono',Consolas,monospace;font-size:12px;color:#e2e8f0;
+  white-space:nowrap;overflow-x:auto;line-height:1.6}
+.cmd-box .copy-btn{flex-shrink:0;padding:3px 8px;font-size:11px;border:1px solid #475569;border-radius:4px;
+  background:transparent;color:#94a3b8;cursor:pointer;font-family:inherit}
+.cmd-box .copy-btn:hover{background:#334155;color:#e2e8f0}
+
+.conns-section{border-top:1px solid var(--border);padding:12px 20px;background:#f8fafc}
+.conns-title{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:600;margin-bottom:8px}
+.conn-item{display:flex;align-items:center;gap:12px;padding:4px 0;font-size:13px}
+.conn-item .conn-dot{width:6px;height:6px;border-radius:50%;background:var(--success);flex-shrink:0}
+.conn-item code{font-family:'SF Mono',Consolas,monospace;font-size:12px}
+.conn-item .conn-arrow{color:var(--muted);font-size:12px}
+.no-conns{font-size:12px;color:var(--muted);font-style:italic}
+
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;justify-content:center;align-items:center}
+.overlay.show{display:flex}
+.modal{background:var(--surface);border-radius:var(--radius);padding:24px;width:400px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,.2)}
+.modal h3{font-size:16px;margin-bottom:16px}
+.fg{margin-bottom:12px}
+.fg label{display:block;font-size:13px;font-weight:500;color:var(--muted);margin-bottom:4px}
+.fg input{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:6px;font-size:14px;outline:none}
+.fg input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
+.modal-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:14px;
+  color:#fff;z-index:200;animation:slideUp .3s ease;font-weight:500}
+.toast.ok{background:var(--success)}.toast.err{background:var(--danger)}
+@keyframes slideUp{from{transform:translateY(16px);opacity:0}to{transform:translateY(0);opacity:1}}
+@media(max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+
+<!-- login screen -->
+<div id="login-screen" class="login-wrap">
+  <button class="btn-lang login-lang" onclick="toggleLang()" id="login-lang-btn">中文</button>
+  <div class="login-box">
+    <h1><em>Ping</em>Tunnel</h1>
+    <div class="login-sub" data-i18n="login_sub"></div>
+    <form onsubmit="doLogin(event)">
+      <div class="fg"><label data-i18n="username"></label><input id="login-user" value="admin"></div>
+      <div class="fg"><label data-i18n="password"></label><input id="login-pass" type="password" data-ph="login_ph"></div>
+      <div id="login-err" class="login-err"></div>
+      <button type="submit" class="btn btn-p" style="width:100%;margin-top:4px" data-i18n="login_btn"></button>
+    </form>
+  </div>
+</div>
+
+<!-- main app -->
+<div id="app" style="display:none">
+<div class="container">
+  <header>
+    <h1><em>Ping</em>Tunnel</h1>
+    <div class="header-acts">
+      <button class="btn-lang" onclick="toggleLang()" id="app-lang-btn">中文</button>
+      <button class="btn-logout" onclick="doLogout()" data-i18n="logout"></button>
+    </div>
+  </header>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-label" data-i18n="stat_in"></div><div class="stat-val" id="si">0</div></div>
+    <div class="stat"><div class="stat-label" data-i18n="stat_out"></div><div class="stat-val" id="so">0</div></div>
+    <div class="stat"><div class="stat-label" data-i18n="stat_conns"></div><div class="stat-val" id="sc">0</div></div>
+    <div class="stat"><div class="stat-label" data-i18n="stat_badkey"></div><div class="stat-val" id="sb">0</div></div>
+  </div>
+
+  <div class="section-hd">
+    <h2 data-i18n="keys_title"></h2>
+    <button class="btn btn-p" onclick="showModal()" data-i18n="new_key"></button>
+  </div>
+  <div id="list"><div class="empty" data-i18n="loading"></div></div>
+</div>
+</div>
+
+<div class="overlay" id="dlg">
+  <div class="modal">
+    <h3 data-i18n="modal_title"></h3>
+    <div class="fg"><label data-i18n="key"></label><input id="nk" data-ph="ph_key"></div>
+    <div class="fg"><label data-i18n="name"></label><input id="nn" data-ph="ph_name"></div>
+    <div style="border-top:1px solid var(--border);margin:16px 0 12px;padding-top:12px">
+      <div style="font-size:12px;color:var(--muted);font-weight:600;margin-bottom:8px" data-i18n="port_mapping_hint"></div>
+      <div class="fg"><label data-i18n="listen_addr"></label><input id="nl" data-ph="ph_listen"></div>
+      <div class="fg"><label data-i18n="target_addr"></label><input id="nt" data-ph="ph_target"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-o" onclick="hideModal()" data-i18n="cancel"></button>
+      <button class="btn btn-p" onclick="addKey()" data-i18n="add"></button>
+    </div>
+  </div>
+</div>
+
+<script>
+const I18N={
+  en:{
+    login_sub:'Server Management Console',
+    username:'Username', password:'Password', login_ph:'Enter -key value', login_btn:'Login',
+    login_empty:'Please enter username and password', login_fail:'Login failed', login_conn_fail:'Connection failed',
+    logout:'Logout',
+    stat_in:'ICMP In', stat_out:'ICMP Out', stat_conns:'Connections', stat_badkey:'Bad Keys',
+    keys_title:'Keys & Forwarding Rules', new_key:'+ New Key', loading:'Loading...',
+    modal_title:'Add Key & Port Mapping', key:'Key', name:'Name',
+    port_mapping_hint:'PORT MAPPING (at least one rule required)',
+    listen_addr:'Listen Address', target_addr:'Target Address',
+    cancel:'Cancel', add:'Add',
+    ph_key:'e.g. my-secret-key', ph_name:'e.g. Production',
+    ph_listen:'e.g. :4455', ph_target:'e.g. 192.168.33.1:22',
+    ph_listen_add:'Listen, e.g. :4455', ph_target_add:'Target, e.g. 192.168.33.1:22',
+    delete:'Delete', listen:'Listen', target:'Target', status:'Status',
+    active:'Active', idle:'Idle', copy:'Copy', copied:'Copied!',
+    total:'Total', active_conns:'Active Connections',
+    icmp_client:'ICMP Client: ', icmp_offline:'ICMP Client: offline',
+    no_conns:'No active connections',
+    hint_allowall:'CLI key — any forwarding allowed.',
+    hint_norules:'No port mappings. Client connections will be rejected. Add a rule below.',
+    empty_keys:'No keys configured. Click "+ New Key" to add one.',
+    key_required:'Key is required',
+    mapping_required:'Port mapping (listen + target) is required',
+    key_added:'Key added', key_deleted:'Key deleted',
+    rule_added:'Rule added', rule_removed:'Rule removed',
+    both_required:'Both fields required', copy_fail:'Copy failed',
+    confirm_delete:'Delete this key and all its rules?',
+    lang_toggle:'中文'
+  },
+  zh:{
+    login_sub:'服务器管理控制台',
+    username:'用户名', password:'密码', login_ph:'输入 -key 的值', login_btn:'登录',
+    login_empty:'请输入用户名和密码', login_fail:'登录失败', login_conn_fail:'连接失败',
+    logout:'退出',
+    stat_in:'ICMP 入', stat_out:'ICMP 出', stat_conns:'连接数', stat_badkey:'无效密钥',
+    keys_title:'密钥与转发规则', new_key:'+ 新增密钥', loading:'加载中...',
+    modal_title:'添加密钥与端口映射', key:'密钥', name:'名称',
+    port_mapping_hint:'端口映射（至少需要一条规则）',
+    listen_addr:'监听地址', target_addr:'目标地址',
+    cancel:'取消', add:'添加',
+    ph_key:'例如 my-secret-key', ph_name:'例如 Production',
+    ph_listen:'例如 :4455', ph_target:'例如 192.168.33.1:22',
+    ph_listen_add:'监听地址，例如 :4455', ph_target_add:'目标地址，例如 192.168.33.1:22',
+    delete:'删除', listen:'监听', target:'目标', status:'状态',
+    active:'活跃', idle:'空闲', copy:'复制', copied:'已复制!',
+    total:'总流量', active_conns:'活跃连接',
+    icmp_client:'ICMP 客户端: ', icmp_offline:'ICMP 客户端: 离线',
+    no_conns:'暂无活跃连接',
+    hint_allowall:'CLI 密钥 — 允许任意转发。',
+    hint_norules:'无端口映射。客户端连接将被拒绝，请在下方添加规则。',
+    empty_keys:'尚未配置密钥，点击"+ 新增密钥"添加。',
+    key_required:'密钥不能为空',
+    mapping_required:'端口映射（监听 + 目标）不能为空',
+    key_added:'密钥已添加', key_deleted:'密钥已删除',
+    rule_added:'规则已添加', rule_removed:'规则已删除',
+    both_required:'两个字段都不能为空', copy_fail:'复制失败',
+    confirm_delete:'确定删除该密钥及其所有规则？',
+    lang_toggle:'EN'
+  }
+};
+
+let curLang=localStorage.getItem('pt_lang')||'en';
+let K=[],S={},pollStatus,pollKeys;
+const $=id=>document.getElementById(id);
+function t(k){return I18N[curLang][k]||I18N.en[k]||k}
+
+function applyLang(){
+  document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n)});
+  document.querySelectorAll('[data-ph]').forEach(el=>{el.placeholder=t(el.dataset.ph)});
+  $('login-lang-btn').textContent=t('lang_toggle');
+  $('app-lang-btn').textContent=t('lang_toggle');
+  document.title='PingTunnel '+t('login_sub');
+}
+
+function toggleLang(){
+  curLang=curLang==='en'?'zh':'en';
+  localStorage.setItem('pt_lang',curLang);
+  applyLang();
+  if(K.length)render();
+}
+
+function fmt(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return n}
+function fmtB(b){if(b>=1073741824)return(b/1073741824).toFixed(2)+' GB';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(1)+' KB';return b+' B'}
+function fmtSpd(b){return fmtB(b)+'/s'}
+function esc(s){let d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function serverIP(){let h=location.hostname;return(h&&h!=='localhost'&&h!=='127.0.0.1')?h:'<SERVER_IP>'}
+function clientCmd(key,rule){return 'sudo pingtunnel -type client -l '+rule.listen_addr+' -s '+serverIP()+' -t '+rule.target_addr+' -key '+key}
+
+async function api(path,opts){
+  const r=await fetch(path,opts);
+  if(r.status===401&&path!=='/api/login'){showLoginScreen();throw new Error('session expired')}
+  const j=await r.json();
+  if(!r.ok)throw new Error(j.error||'request failed');
+  return j;
+}
+
+function showLoginScreen(){
+  $('app').style.display='none';
+  $('login-screen').style.display='';
+  $('login-pass').value='';
+  $('login-err').textContent='';
+  clearInterval(pollStatus);clearInterval(pollKeys);
+}
+
+function showApp(){
+  $('login-screen').style.display='none';
+  $('app').style.display='block';
+  loadStatus();loadKeys();
+  pollStatus=setInterval(loadStatus,3000);
+  pollKeys=setInterval(loadKeys,3000);
+}
+
+async function doLogin(e){
+  e.preventDefault();
+  $('login-err').textContent='';
+  const u=$('login-user').value.trim(), p=$('login-pass').value;
+  if(!u||!p){$('login-err').textContent=t('login_empty');return}
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:u,password:p})});
+    const j=await r.json();
+    if(!r.ok){$('login-err').textContent=j.error||t('login_fail');return}
+    showApp();
+  }catch(e){$('login-err').textContent=t('login_conn_fail')}
+}
+
+function doLogout(){
+  document.cookie='pt_session=;path=/;max-age=0';
+  showLoginScreen();
+}
+
+async function checkSession(){
+  try{
+    const r=await fetch('/api/status');
+    if(r.ok){S=await r.json();showApp()}
+    else{showLoginScreen()}
+  }catch(e){showLoginScreen()}
+}
+
+async function loadStatus(){
+  try{S=await api('/api/status');
+    $('si').textContent=fmt(S.icmp_in||0);
+    $('so').textContent=fmt(S.icmp_out||0);
+    $('sc').textContent=S.active_conns||0;
+    $('sb').textContent=S.bad_key||0;
+  }catch(e){}
+}
+
+async function loadKeys(){
+  try{K=await api('/api/keys');render()}catch(e){}
+}
+
+function render(){
+  const el=$('list');
+  const ae=document.activeElement;
+  if(ae&&el.contains(ae)&&ae.tagName==='INPUT')return;
+  const lns=S.listeners||[];
+  if(!K||!K.length){el.innerHTML='<div class="empty">'+esc(t('empty_keys'))+'</div>';return}
+  let h='';
+  for(let i=0;i<K.length;i++){
+    const k=K[i], rules=k.rules||[];
+    h+='<div class="card"><div class="card-hd"><div><span class="name">'+esc(k.name||'Unnamed')+'</span>'
+      +'<code>'+esc(k.key)+'</code></div>'
+      +'<div class="acts"><button class="btn btn-d btn-s" onclick="delKey(\''+k.id+'\')">'+t('delete')+'</button></div></div>';
+
+    h+='<div class="card-traffic">'
+      +'<span class="spd"><span class="arrow up">↑</span> <span class="val">'+fmtSpd(k.speed_in||0)+'</span></span>'
+      +'<span class="spd"><span class="arrow dn">↓</span> <span class="val">'+fmtSpd(k.speed_out||0)+'</span></span>'
+      +'<span class="sep"></span>'
+      +'<span><span class="total-lbl">'+t('total')+'</span>'
+      +'<span class="arrow up">↑</span> '+fmtB(k.total_in||0)
+      +'&nbsp;&nbsp;<span class="arrow dn">↓</span> '+fmtB(k.total_out||0)+'</span>'
+      +'</div>';
+
+    h+='<table><thead><tr><th>'+t('listen')+'</th><th>'+t('target')+'</th><th>'+t('status')+'</th><th></th></tr></thead><tbody>';
+    if(rules.length){
+      for(let j=0;j<rules.length;j++){
+        const r=rules[j], on=lns.indexOf(r.listen_addr)>=0;
+        const cmd=clientCmd(k.key,r);
+        h+='<tr><td><code>'+esc(r.listen_addr)+'</code></td><td><code>'+esc(r.target_addr)+'</code></td>'
+          +'<td><span class="badge '+(on?'badge-on':'badge-off')+'">'+(on?t('active'):t('idle'))+'</span></td>'
+          +'<td style="text-align:right"><button class="btn-g" onclick="delRule(\''+k.id+"','"+r.id+"')\">✕</button></td></tr>"
+          +'<tr><td colspan="4" class="cmd-row"><div class="cmd-box"><code>'+esc(cmd)+'</code>'
+          +'<button class="copy-btn" onclick="copyCmd(this)">'+t('copy')+'</button></div></td></tr>';
+      }
+    }else{
+      if(k.allow_all){
+        h+='<tr><td colspan="4" class="hint">'+esc(t('hint_allowall'))+'</td></tr>';
+      }else{
+        h+='<tr><td colspan="4" class="hint" style="color:var(--danger)">'+esc(t('hint_norules'))+'</td></tr>';
+      }
+    }
+    h+='</tbody></table>';
+
+    const conns=k.conns||[];
+    const ca=S.client_addr||'';
+    h+='<div class="conns-section">';
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
+      +'<div class="conns-title" style="margin-bottom:0">'+t('active_conns')+' ('+conns.length+')</div>';
+    if(ca){h+='<div style="font-size:12px"><span style="color:var(--muted)">'+t('icmp_client')+'</span><code style="font-size:12px;color:var(--success)">'+esc(ca)+'</code></div>';}
+    else{h+='<div style="font-size:12px;color:var(--muted)">'+esc(t('icmp_offline'))+'</div>';}
+    h+='</div>';
+    if(conns.length){
+      for(let c=0;c<conns.length;c++){
+        const cn=conns[c];
+        h+='<div class="conn-item"><span class="conn-dot"></span>'
+          +'<code>'+esc(cn.client_addr)+'</code>'
+          +'<span class="conn-arrow">→</span>'
+          +'<code>'+esc(cn.target_addr)+'</code></div>';
+      }
+    }else{
+      h+='<div class="no-conns">'+esc(t('no_conns'))+'</div>';
+    }
+    h+='</div>';
+
+    h+='<div class="add-row"><input placeholder="'+t('ph_listen_add')+'" id="rl-'+k.id+'">'
+      +'<input placeholder="'+t('ph_target_add')+'" id="rt-'+k.id+'">'
+      +'<button class="btn btn-p btn-s" onclick="addRule(\''+k.id+"')\">"+t('add')+'</button></div></div>';
+  }
+  el.innerHTML=h;
+}
+
+function showModal(){$('dlg').classList.add('show');$('nk').focus()}
+function hideModal(){$('dlg').classList.remove('show')}
+
+async function addKey(){
+  const key=$('nk').value.trim(), name=$('nn').value.trim()||'Unnamed';
+  const listen=$('nl').value.trim(), target=$('nt').value.trim();
+  if(!key){toast(t('key_required'),'err');return}
+  if(!listen||!target){toast(t('mapping_required'),'err');return}
+  try{await api('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key,name,listen_addr:listen,target_addr:target})});
+    $('nk').value='';$('nn').value='';$('nl').value='';$('nt').value='';
+    hideModal();toast(t('key_added'),'ok');loadKeys();
+  }catch(e){toast(e.message,'err')}
+}
+
+async function delKey(id){
+  if(!confirm(t('confirm_delete')))return;
+  try{await api('/api/keys/'+id,{method:'DELETE'});toast(t('key_deleted'),'ok');loadKeys()}
+  catch(e){toast(e.message,'err')}
+}
+
+async function addRule(kid){
+  const l=$('rl-'+kid).value.trim(), tt=$('rt-'+kid).value.trim();
+  if(!l||!tt){toast(t('both_required'),'err');return}
+  try{await api('/api/keys/'+kid+'/rules',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({listen_addr:l,target_addr:tt})});toast(t('rule_added'),'ok');loadKeys();
+  }catch(e){toast(e.message,'err')}
+}
+
+async function delRule(kid,rid){
+  try{await api('/api/keys/'+kid+'/rules/'+rid,{method:'DELETE'});toast(t('rule_removed'),'ok');loadKeys()}
+  catch(e){toast(e.message,'err')}
+}
+
+function copyCmd(btn){
+  const code=btn.parentElement.querySelector('code');
+  navigator.clipboard.writeText(code.textContent).then(()=>{
+    btn.textContent=t('copied');setTimeout(()=>{btn.textContent=t('copy')},1500);
+  }).catch(()=>{toast(t('copy_fail'),'err')});
+}
+
+function toast(msg,cls){
+  const el=document.createElement('div');el.className='toast '+cls;el.textContent=msg;
+  document.body.appendChild(el);setTimeout(()=>el.remove(),3000);
+}
+
+applyLang();
+checkSession();
+</script>
+</body>
+</html>
