@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,10 +27,9 @@ type Server struct {
 	sendQueues   map[[16]byte]chan *TunnelPacket
 	sendQueuesMu sync.Mutex
 
-	// Last ICMP source address per authenticated key (for status UI).
-	icmpPeers    map[[16]byte]net.Addr
-	icmpLastSeen map[[16]byte]time.Time
-	icmpPeersMu  sync.RWMutex
+	// ICMP tunnel client (source) per forwarding rule: key = hex(keyHash)|tcp/ or udp/ + listen.
+	ruleTunnelClients map[string]*ruleTunnelState
+	ruleTunnelMu      sync.Mutex
 
 	listenersTCP map[string]net.Listener
 	listenersUDP map[string]*net.UDPConn
@@ -71,17 +72,21 @@ type ServerConn struct {
 	idleTimer *time.Timer
 }
 
+type ruleTunnelState struct {
+	addr     net.Addr
+	lastSeen time.Time
+}
+
 func NewServer(mgr *Manager) *Server {
 	return &Server{
-		manager:      mgr,
-		sendQueues:   make(map[[16]byte]chan *TunnelPacket),
-		icmpPeers:    make(map[[16]byte]net.Addr),
-		icmpLastSeen: make(map[[16]byte]time.Time),
-		listenersTCP: make(map[string]net.Listener),
-		listenersUDP: make(map[string]*net.UDPConn),
-		udpSessions:  make(map[string]*ServerConn),
-		connections:  make(map[uint32]*ServerConn),
-		done:         make(chan struct{}),
+		manager:           mgr,
+		sendQueues:        make(map[[16]byte]chan *TunnelPacket),
+		ruleTunnelClients: make(map[string]*ruleTunnelState),
+		listenersTCP:      make(map[string]net.Listener),
+		listenersUDP:      make(map[string]*net.UDPConn),
+		udpSessions:       make(map[string]*ServerConn),
+		connections:       make(map[uint32]*ServerConn),
+		done:              make(chan struct{}),
 	}
 }
 
@@ -118,10 +123,9 @@ func (s *Server) Close() {
 	}
 	s.sendQueues = make(map[[16]byte]chan *TunnelPacket)
 	s.sendQueuesMu.Unlock()
-	s.icmpPeersMu.Lock()
-	s.icmpPeers = make(map[[16]byte]net.Addr)
-	s.icmpLastSeen = make(map[[16]byte]time.Time)
-	s.icmpPeersMu.Unlock()
+	s.ruleTunnelMu.Lock()
+	s.ruleTunnelClients = make(map[string]*ruleTunnelState)
+	s.ruleTunnelMu.Unlock()
 }
 
 func (s *Server) Run() error {
@@ -176,13 +180,8 @@ func (s *Server) Run() error {
 		atomic.AddUint64(&s.stats.icmpIn, 1)
 
 		clientKeyHash := pkt.KeyHash
-		now := time.Now()
-		s.icmpPeersMu.Lock()
-		s.icmpPeers[clientKeyHash] = addr
-		s.icmpLastSeen[clientKeyHash] = now
-		s.icmpPeersMu.Unlock()
-
-		s.handlePacket(pkt)
+		s.handlePacket(pkt, addr)
+		s.noteRuleTunnelICMP(clientKeyHash, addr)
 
 		resp := s.dequeueForKey(clientKeyHash)
 		resp.Magic = MagicResponse
@@ -209,10 +208,10 @@ func (s *Server) Run() error {
 
 // --------------- packet handlers ---------------
 
-func (s *Server) handlePacket(pkt *TunnelPacket) {
+func (s *Server) handlePacket(pkt *TunnelPacket, from net.Addr) {
 	switch pkt.Cmd {
 	case CmdSetup:
-		s.handleSetup(pkt)
+		s.handleSetup(pkt, from)
 	case CmdConnectAck:
 		s.handleConnectAck(pkt)
 	case CmdData:
@@ -224,7 +223,7 @@ func (s *Server) handlePacket(pkt *TunnelPacket) {
 	}
 }
 
-func (s *Server) handleSetup(pkt *TunnelPacket) {
+func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
 	parts := bytes.Split(pkt.Data, []byte("|"))
 	if len(parts) < 2 {
 		log.Println("[server] bad setup payload")
@@ -269,6 +268,7 @@ func (s *Server) handleSetup(pkt *TunnelPacket) {
 		}
 	}
 	s.enqueueKey(pkt.KeyHash, &TunnelPacket{Cmd: CmdSetupAck})
+	s.registerRuleTunnelClient(pkt.KeyHash, mapKey, from)
 	log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s", listenAddr, targetAddr, protocol)
 }
 
@@ -621,38 +621,82 @@ func (s *Server) GetConnsByKey() map[[16]byte][]ConnInfo {
 	return m
 }
 
-func (s *Server) pruneStaleICMPPeers() {
+func ruleTunnelMapKey(keyHash [16]byte, listenerMapKey string) string {
+	return hex.EncodeToString(keyHash[:]) + "|" + listenerMapKey
+}
+
+func (s *Server) registerRuleTunnelClient(keyHash [16]byte, listenerMapKey string, from net.Addr) {
+	if from == nil {
+		return
+	}
+	k := ruleTunnelMapKey(keyHash, listenerMapKey)
+	s.ruleTunnelMu.Lock()
+	s.ruleTunnelClients[k] = &ruleTunnelState{addr: from, lastSeen: time.Now()}
+	s.ruleTunnelMu.Unlock()
+}
+
+func (s *Server) noteRuleTunnelICMP(keyHash [16]byte, from net.Addr) {
+	if from == nil {
+		return
+	}
+	prefix := hex.EncodeToString(keyHash[:]) + "|"
 	now := time.Now()
-	s.icmpPeersMu.Lock()
-	for h, t := range s.icmpLastSeen {
-		if now.Sub(t) > icmpClientHeartbeatTTL {
-			delete(s.icmpLastSeen, h)
-			delete(s.icmpPeers, h)
+	s.ruleTunnelMu.Lock()
+	for mapKey, st := range s.ruleTunnelClients {
+		if st == nil || st.addr == nil {
+			continue
+		}
+		if !strings.HasPrefix(mapKey, prefix) {
+			continue
+		}
+		if st.addr.String() == from.String() {
+			st.lastSeen = now
 		}
 	}
-	s.icmpPeersMu.Unlock()
+	s.ruleTunnelMu.Unlock()
 }
 
-// IsICMPOnlineForKey reports whether a tunnel client has sent ICMP recently for this key.
-func (s *Server) IsICMPOnlineForKey(h [16]byte) bool {
-	s.icmpPeersMu.RLock()
-	defer s.icmpPeersMu.RUnlock()
-	t, ok := s.icmpLastSeen[h]
-	return ok && time.Since(t) <= icmpClientHeartbeatTTL
+func (s *Server) ruleListenMapKey(r *ForwardRule) string {
+	return ListenerMapKey(normalizeProtocol(r.Protocol), r.ListenAddr)
 }
 
-// ICMPClientAddrForKey returns the last seen ICMP source address for this key, or "" if offline.
-func (s *Server) ICMPClientAddrForKey(h [16]byte) string {
-	s.icmpPeersMu.RLock()
-	defer s.icmpPeersMu.RUnlock()
-	t, ok := s.icmpLastSeen[h]
-	if !ok || time.Since(t) > icmpClientHeartbeatTTL {
+// IsRuleTunnelOnline is true when this rule's listen port has a tunnel client sending ICMP recently.
+func (s *Server) IsRuleTunnelOnline(keyHash [16]byte, r *ForwardRule) bool {
+	k := ruleTunnelMapKey(keyHash, s.ruleListenMapKey(r))
+	s.ruleTunnelMu.Lock()
+	st, ok := s.ruleTunnelClients[k]
+	if !ok || st == nil || st.addr == nil {
+		s.ruleTunnelMu.Unlock()
+		return false
+	}
+	on := time.Since(st.lastSeen) <= icmpClientHeartbeatTTL
+	s.ruleTunnelMu.Unlock()
+	return on
+}
+
+// ICMPClientAddrForRule returns the ICMP source seen for this listen rule, or "" if offline.
+func (s *Server) ICMPClientAddrForRule(keyHash [16]byte, r *ForwardRule) string {
+	k := ruleTunnelMapKey(keyHash, s.ruleListenMapKey(r))
+	s.ruleTunnelMu.Lock()
+	st, ok := s.ruleTunnelClients[k]
+	if !ok || st == nil || st.addr == nil || time.Since(st.lastSeen) > icmpClientHeartbeatTTL {
+		s.ruleTunnelMu.Unlock()
 		return ""
 	}
-	if a, ok := s.icmpPeers[h]; ok {
-		return a.String()
+	a := st.addr.String()
+	s.ruleTunnelMu.Unlock()
+	return a
+}
+
+func (s *Server) pruneStaleICMPPeers() {
+	now := time.Now()
+	s.ruleTunnelMu.Lock()
+	for k, st := range s.ruleTunnelClients {
+		if st == nil || now.Sub(st.lastSeen) > icmpClientHeartbeatTTL {
+			delete(s.ruleTunnelClients, k)
+		}
 	}
-	return ""
+	s.ruleTunnelMu.Unlock()
 }
 
 // --------------- background loops ---------------

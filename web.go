@@ -158,19 +158,25 @@ func (ws *webServer) apiListKeys(w http.ResponseWriter) {
 	ws.srv.pruneStaleICMPPeers()
 	keys := ws.mgr.GetKeys()
 	connsByKey := ws.srv.GetConnsByKey()
+	type ruleWithTunnel struct {
+		ID             string `json:"id"`
+		ListenAddr     string `json:"listen_addr"`
+		TargetAddr     string `json:"target_addr"`
+		Protocol       string `json:"protocol,omitempty"`
+		IcmpOnline     bool   `json:"icmp_online"`
+		IcmpClientAddr string `json:"icmp_client_addr,omitempty"`
+	}
 	type keyResp struct {
-		ID             string         `json:"id"`
-		Key            string         `json:"key"`
-		Name           string         `json:"name"`
-		AllowAll       bool           `json:"allow_all"`
-		IcmpOnline     bool           `json:"icmp_online"`
-		IcmpClientAddr string         `json:"icmp_client_addr,omitempty"`
-		Rules          []*ForwardRule `json:"rules"`
-		TotalIn        uint64         `json:"total_in"`
-		TotalOut       uint64         `json:"total_out"`
-		SpeedIn        uint64         `json:"speed_in"`
-		SpeedOut       uint64         `json:"speed_out"`
-		Conns          []ConnInfo     `json:"conns"`
+		ID       string           `json:"id"`
+		Key      string           `json:"key"`
+		Name     string           `json:"name"`
+		AllowAll bool             `json:"allow_all"`
+		Rules    []ruleWithTunnel `json:"rules"`
+		TotalIn  uint64           `json:"total_in"`
+		TotalOut uint64           `json:"total_out"`
+		SpeedIn  uint64           `json:"speed_in"`
+		SpeedOut uint64           `json:"speed_out"`
+		Conns    []ConnInfo       `json:"conns"`
 	}
 	resp := make([]keyResp, len(keys))
 	for i, k := range keys {
@@ -179,23 +185,32 @@ func (ws *webServer) apiListKeys(w http.ResponseWriter) {
 		if rules == nil {
 			rules = make([]*ForwardRule, 0)
 		}
+		rulesOut := make([]ruleWithTunnel, len(rules))
+		for j, r := range rules {
+			rulesOut[j] = ruleWithTunnel{
+				ID:             r.ID,
+				ListenAddr:     r.ListenAddr,
+				TargetAddr:     r.TargetAddr,
+				Protocol:       r.Protocol,
+				IcmpOnline:     ws.srv.IsRuleTunnelOnline(k.Hash, r),
+				IcmpClientAddr: ws.srv.ICMPClientAddrForRule(k.Hash, r),
+			}
+		}
 		conns := connsByKey[k.Hash]
 		if conns == nil {
 			conns = make([]ConnInfo, 0)
 		}
 		resp[i] = keyResp{
-			ID:             k.ID,
-			Key:            k.Key,
-			Name:           k.Name,
-			AllowAll:       k.AllowAll,
-			IcmpOnline:     ws.srv.IsICMPOnlineForKey(k.Hash),
-			IcmpClientAddr: ws.srv.ICMPClientAddrForKey(k.Hash),
-			Rules:          rules,
-			TotalIn:        k.TotalIn + sessIn,
-			TotalOut:       k.TotalOut + sessOut,
-			SpeedIn:        si,
-			SpeedOut:       so,
-			Conns:          conns,
+			ID:       k.ID,
+			Key:      k.Key,
+			Name:     k.Name,
+			AllowAll: k.AllowAll,
+			Rules:    rulesOut,
+			TotalIn:  k.TotalIn + sessIn,
+			TotalOut: k.TotalOut + sessOut,
+			SpeedIn:  si,
+			SpeedOut: so,
+			Conns:    conns,
 		}
 	}
 	json.NewEncoder(w).Encode(resp)

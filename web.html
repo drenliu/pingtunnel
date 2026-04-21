@@ -195,10 +195,10 @@ const I18N={
     ph_key:'e.g. my-secret-key',
     ph_listen:'e.g. :4455', ph_target:'e.g. 192.168.33.1:22',
     ph_listen_add:'Listen, e.g. :4455', ph_target_add:'Target, e.g. 192.168.33.1:22',
-    delete:'Delete', listen:'Listen', target:'Target', proto:'Proto', status:'Status',
+    delete:'Delete', listen:'Listen', target:'Target', proto:'Proto', tunnel_client:'ICMP client', status:'Status',
     active:'Active', idle:'Idle', copy:'Copy', copied:'Copied!',
     total:'Total', active_conns:'Active Connections',
-    icmp_client:'ICMP tunnel client', icmp_offline:'No ICMP client online',
+    icmp_dash:'—',
     no_conns:'No active connections',
     hint_allowall:'CLI key — any forwarding allowed.',
     hint_norules:'No port mappings. Client connections will be rejected. Add a rule below.',
@@ -225,10 +225,10 @@ const I18N={
     ph_key:'例如 my-secret-key',
     ph_listen:'例如 :4455', ph_target:'例如 192.168.33.1:22',
     ph_listen_add:'监听地址，例如 :4455', ph_target_add:'目标地址，例如 192.168.33.1:22',
-    delete:'删除', listen:'监听', target:'目标', proto:'协议', status:'状态',
+    delete:'删除', listen:'监听', target:'目标', proto:'协议', tunnel_client:'ICMP 客户端', status:'状态',
     active:'活跃', idle:'空闲', copy:'复制', copied:'已复制!',
     total:'总流量', active_conns:'活跃连接',
-    icmp_client:'ICMP 隧道客户端', icmp_offline:'暂无 ICMP 客户端在线',
+    icmp_dash:'—',
     no_conns:'暂无活跃连接',
     hint_allowall:'CLI 密钥 — 允许任意转发。',
     hint_norules:'无端口映射。客户端连接将被拒绝，请在下方添加规则。',
@@ -372,39 +372,34 @@ function render(){
       +'&nbsp;&nbsp;<span class="arrow dn">↓</span> '+fmtB(k.total_out||0)+'</span>'
       +'</div>';
 
-    h+='<table><thead><tr><th>'+t('listen')+'</th><th>'+t('target')+'</th><th>'+t('proto')+'</th><th>'+t('status')+'</th><th></th></tr></thead><tbody>';
+    h+='<table><thead><tr><th>'+t('listen')+'</th><th>'+t('target')+'</th><th>'+t('proto')+'</th><th>'+t('tunnel_client')+'</th><th>'+t('status')+'</th><th></th></tr></thead><tbody>';
     if(rules.length){
       for(let j=0;j<rules.length;j++){
         const r=rules[j], pk=listenerMapKey(r.protocol,r.listen_addr),
-          on=lns.indexOf(pk)>=0&&(k.icmp_online===true);
+          on=lns.indexOf(pk)>=0&&(r.icmp_online===true);
         const pr=((r.protocol||'tcp').toLowerCase()==='udp')?'UDP':'TCP';
+        const icmpShow=(r.icmp_client_addr&&r.icmp_client_addr.trim())?'<code style="font-size:12px;color:var(--success)">'+esc(r.icmp_client_addr.trim())+'</code>':'<span style="color:var(--muted)">'+esc(t('icmp_dash'))+'</span>';
         const cmd=clientCmd(k.key,r);
         h+='<tr><td><code>'+esc(r.listen_addr)+'</code></td><td><code>'+esc(r.target_addr)+'</code></td><td><code>'+pr+'</code></td>'
+          +'<td>'+icmpShow+'</td>'
           +'<td><span class="badge '+(on?'badge-on':'badge-off')+'">'+(on?t('active'):t('idle'))+'</span></td>'
           +'<td style="text-align:right"><button class="btn-g" onclick="delRule(\''+k.id+"','"+r.id+"')\">✕</button></td></tr>"
-          +'<tr><td colspan="5" class="cmd-row"><div class="cmd-box"><code>'+esc(cmd)+'</code>'
+          +'<tr><td colspan="6" class="cmd-row"><div class="cmd-box"><code>'+esc(cmd)+'</code>'
           +'<button class="copy-btn" onclick="copyCmd(this)">'+t('copy')+'</button></div></td></tr>';
       }
     }else{
       if(k.allow_all){
-        h+='<tr><td colspan="5" class="hint">'+esc(t('hint_allowall'))+'</td></tr>';
+        h+='<tr><td colspan="6" class="hint">'+esc(t('hint_allowall'))+'</td></tr>';
       }else{
-        h+='<tr><td colspan="5" class="hint" style="color:var(--danger)">'+esc(t('hint_norules'))+'</td></tr>';
+        h+='<tr><td colspan="6" class="hint" style="color:var(--danger)">'+esc(t('hint_norules'))+'</td></tr>';
       }
     }
     h+='</tbody></table>';
 
     const conns=k.conns||[];
-    const icmpAddr=(k.icmp_client_addr||'').trim();
     h+='<div class="conns-section">';
     h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
       +'<div class="conns-title" style="margin-bottom:0">'+t('active_conns')+' ('+conns.length+')</div>';
-    h+='<div style="font-size:11px;color:var(--muted);margin-bottom:6px">'+esc(t('icmp_client'))+'</div>';
-    if(icmpAddr){
-      h+='<div style="font-size:12px;margin-bottom:8px"><code style="font-size:12px;color:var(--success)">'+esc(icmpAddr)+'</code></div>';
-    }else{
-      h+='<div style="font-size:12px;color:var(--muted);margin-bottom:8px">'+esc(t('icmp_offline'))+'</div>';
-    }
     h+='</div>';
     if(conns.length){
       for(let c=0;c<conns.length;c++){
