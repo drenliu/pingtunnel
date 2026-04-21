@@ -15,16 +15,17 @@ func main() {
 	listen := flag.String("l", "", "listen address, e.g. :4455")
 	server := flag.String("s", "", "server address, e.g. 120.46.204.235")
 	target := flag.String("t", "", "target address, e.g. 192.168.33.1:22")
+	protocol := flag.String("protocol", "tcp", "forwarding protocol: tcp or udp (client only)")
 	webAddr := flag.String("web", ":8080", "web management listen address")
 
 	flag.Parse()
 
 	if *typeFlag == "" {
-		fmt.Println("pingtunnel - TCP port forwarding over ICMP")
+		fmt.Println("pingtunnel - TCP/UDP port forwarding over ICMP")
 		fmt.Println()
 		fmt.Println("Usage:")
 		fmt.Println("  Server:  pingtunnel -type server -key <admin_password> [-web :8080]")
-		fmt.Println("  Client:  pingtunnel -type client -l :4455 -s <server_ip> -t <target> -key <tunnel_key>")
+		fmt.Println("  Client:  pingtunnel -type client -l :4455 -s <server_ip> -t <target> -key <tunnel_key> [-protocol tcp|udp]")
 		fmt.Println()
 		fmt.Println("Server options:")
 		fmt.Println("  -key    Web admin password (username: admin)")
@@ -35,6 +36,7 @@ func main() {
 		fmt.Println("  -s      Server ICMP address")
 		fmt.Println("  -t      Target address to forward to")
 		fmt.Println("  -key    Tunnel authentication key (configured on server via web)")
+		fmt.Println("  -protocol  tcp (default) or udp; must match the server rule")
 		fmt.Println()
 		fmt.Println("Examples:")
 		fmt.Println("  sudo pingtunnel -type server -key 123456")
@@ -78,7 +80,7 @@ func main() {
 		if *server == "" || *target == "" || *listen == "" {
 			log.Fatal("client mode requires -l, -s, and -t flags")
 		}
-		cli := NewClient(*listen, *server, *target, *key)
+		cli := NewClient(*listen, *server, *target, *key, *protocol)
 		go func() {
 			<-sigCh
 			log.Println("shutting down ...")

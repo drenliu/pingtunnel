@@ -170,6 +170,8 @@ td code{font-family:'SF Mono',Consolas,monospace;font-size:13px}
       <div style="font-size:12px;color:var(--muted);font-weight:600;margin-bottom:8px" data-i18n="port_mapping_hint"></div>
       <div class="fg"><label data-i18n="listen_addr"></label><input id="nl" data-ph="ph_listen"></div>
       <div class="fg"><label data-i18n="target_addr"></label><input id="nt" data-ph="ph_target"></div>
+      <div class="fg"><label data-i18n="protocol"></label><select id="nproto" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:6px;font-size:14px">
+        <option value="tcp">TCP</option><option value="udp">UDP</option></select></div>
     </div>
     <div class="modal-foot">
       <button class="btn btn-o" onclick="hideModal()" data-i18n="cancel"></button>
@@ -189,12 +191,12 @@ const I18N={
     keys_title:'Keys & Forwarding Rules', new_key:'+ New Key', loading:'Loading...',
     modal_title:'Add Key & Port Mapping', key:'Key', name:'Name',
     port_mapping_hint:'PORT MAPPING (at least one rule required)',
-    listen_addr:'Listen Address', target_addr:'Target Address',
+    listen_addr:'Listen Address', target_addr:'Target Address', protocol:'Protocol',
     cancel:'Cancel', add:'Add',
     ph_key:'e.g. my-secret-key', ph_name:'e.g. Production',
     ph_listen:'e.g. :4455', ph_target:'e.g. 192.168.33.1:22',
     ph_listen_add:'Listen, e.g. :4455', ph_target_add:'Target, e.g. 192.168.33.1:22',
-    delete:'Delete', listen:'Listen', target:'Target', status:'Status',
+    delete:'Delete', listen:'Listen', target:'Target', proto:'Proto', status:'Status',
     active:'Active', idle:'Idle', copy:'Copy', copied:'Copied!',
     total:'Total', active_conns:'Active Connections',
     icmp_client:'ICMP Client: ', icmp_offline:'ICMP Client: offline',
@@ -219,12 +221,12 @@ const I18N={
     keys_title:'密钥与转发规则', new_key:'+ 新增密钥', loading:'加载中...',
     modal_title:'添加密钥与端口映射', key:'密钥', name:'名称',
     port_mapping_hint:'端口映射（至少需要一条规则）',
-    listen_addr:'监听地址', target_addr:'目标地址',
+    listen_addr:'监听地址', target_addr:'目标地址', protocol:'协议',
     cancel:'取消', add:'添加',
     ph_key:'例如 my-secret-key', ph_name:'例如 Production',
     ph_listen:'例如 :4455', ph_target:'例如 192.168.33.1:22',
     ph_listen_add:'监听地址，例如 :4455', ph_target_add:'目标地址，例如 192.168.33.1:22',
-    delete:'删除', listen:'监听', target:'目标', status:'状态',
+    delete:'删除', listen:'监听', target:'目标', proto:'协议', status:'状态',
     active:'活跃', idle:'空闲', copy:'复制', copied:'已复制!',
     total:'总流量', active_conns:'活跃连接',
     icmp_client:'ICMP 客户端: ', icmp_offline:'ICMP 客户端: 离线',
@@ -267,7 +269,22 @@ function fmtB(b){if(b>=1073741824)return(b/1073741824).toFixed(2)+' GB';if(b>=10
 function fmtSpd(b){return fmtB(b)+'/s'}
 function esc(s){let d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function serverIP(){let h=location.hostname;return(h&&h!=='localhost'&&h!=='127.0.0.1')?h:'<SERVER_IP>'}
-function clientCmd(key,rule){return 'sudo pingtunnel -type client -l '+rule.listen_addr+' -s '+serverIP()+' -t '+rule.target_addr+' -key '+key}
+function normalizeListenJs(addr){
+  addr=(addr||'').trim();if(!addr)return addr;
+  if(addr[0]===':')return '0.0.0.0'+addr;
+  if(addr.indexOf(':')<0)return '0.0.0.0:'+addr;
+  return addr;
+}
+function listenerMapKey(proto,listen){
+  const p=((proto||'tcp').toLowerCase()==='udp')?'udp':'tcp';
+  return p+'/'+normalizeListenJs(listen);
+}
+function clientCmd(key,rule){
+  const pr=(rule.protocol||'tcp').toLowerCase()==='udp'?'udp':'tcp';
+  let cmd='sudo pingtunnel -type client -l '+rule.listen_addr+' -s '+serverIP()+' -t '+rule.target_addr+' -key '+key;
+  if(pr==='udp')cmd+=' -protocol udp';
+  return cmd;
+}
 
 async function api(path,opts){
   const r=await fetch(path,opts);
@@ -355,22 +372,23 @@ function render(){
       +'&nbsp;&nbsp;<span class="arrow dn">↓</span> '+fmtB(k.total_out||0)+'</span>'
       +'</div>';
 
-    h+='<table><thead><tr><th>'+t('listen')+'</th><th>'+t('target')+'</th><th>'+t('status')+'</th><th></th></tr></thead><tbody>';
+    h+='<table><thead><tr><th>'+t('listen')+'</th><th>'+t('target')+'</th><th>'+t('proto')+'</th><th>'+t('status')+'</th><th></th></tr></thead><tbody>';
     if(rules.length){
       for(let j=0;j<rules.length;j++){
-        const r=rules[j], on=lns.indexOf(r.listen_addr)>=0;
+        const r=rules[j], pk=listenerMapKey(r.protocol,r.listen_addr), on=lns.indexOf(pk)>=0;
+        const pr=((r.protocol||'tcp').toLowerCase()==='udp')?'UDP':'TCP';
         const cmd=clientCmd(k.key,r);
-        h+='<tr><td><code>'+esc(r.listen_addr)+'</code></td><td><code>'+esc(r.target_addr)+'</code></td>'
+        h+='<tr><td><code>'+esc(r.listen_addr)+'</code></td><td><code>'+esc(r.target_addr)+'</code></td><td><code>'+pr+'</code></td>'
           +'<td><span class="badge '+(on?'badge-on':'badge-off')+'">'+(on?t('active'):t('idle'))+'</span></td>'
           +'<td style="text-align:right"><button class="btn-g" onclick="delRule(\''+k.id+"','"+r.id+"')\">✕</button></td></tr>"
-          +'<tr><td colspan="4" class="cmd-row"><div class="cmd-box"><code>'+esc(cmd)+'</code>'
+          +'<tr><td colspan="5" class="cmd-row"><div class="cmd-box"><code>'+esc(cmd)+'</code>'
           +'<button class="copy-btn" onclick="copyCmd(this)">'+t('copy')+'</button></div></td></tr>';
       }
     }else{
       if(k.allow_all){
-        h+='<tr><td colspan="4" class="hint">'+esc(t('hint_allowall'))+'</td></tr>';
+        h+='<tr><td colspan="5" class="hint">'+esc(t('hint_allowall'))+'</td></tr>';
       }else{
-        h+='<tr><td colspan="4" class="hint" style="color:var(--danger)">'+esc(t('hint_norules'))+'</td></tr>';
+        h+='<tr><td colspan="5" class="hint" style="color:var(--danger)">'+esc(t('hint_norules'))+'</td></tr>';
       }
     }
     h+='</tbody></table>';
@@ -398,6 +416,8 @@ function render(){
 
     h+='<div class="add-row"><input placeholder="'+t('ph_listen_add')+'" id="rl-'+k.id+'">'
       +'<input placeholder="'+t('ph_target_add')+'" id="rt-'+k.id+'">'
+      +'<select id="rp-'+k.id+'" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px">'
+      +'<option value="tcp">TCP</option><option value="udp">UDP</option></select>'
       +'<button class="btn btn-p btn-s" onclick="addRule(\''+k.id+"')\">"+t('add')+'</button></div></div>';
   }
   el.innerHTML=h;
@@ -411,9 +431,10 @@ async function addKey(){
   const listen=$('nl').value.trim(), target=$('nt').value.trim();
   if(!key){toast(t('key_required'),'err');return}
   if(!listen||!target){toast(t('mapping_required'),'err');return}
+  const prot=$('nproto').value||'tcp';
   try{await api('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key,name,listen_addr:listen,target_addr:target})});
-    $('nk').value='';$('nn').value='';$('nl').value='';$('nt').value='';
+    body:JSON.stringify({key,name,listen_addr:listen,target_addr:target,protocol:prot})});
+    $('nk').value='';$('nn').value='';$('nl').value='';$('nt').value='';$('nproto').value='tcp';
     hideModal();toast(t('key_added'),'ok');loadKeys();
   }catch(e){toast(e.message,'err')}
 }
@@ -426,9 +447,10 @@ async function delKey(id){
 
 async function addRule(kid){
   const l=$('rl-'+kid).value.trim(), tt=$('rt-'+kid).value.trim();
+  const prot=$('rp-'+kid)?$('rp-'+kid).value||'tcp':'tcp';
   if(!l||!tt){toast(t('both_required'),'err');return}
   try{await api('/api/keys/'+kid+'/rules',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({listen_addr:l,target_addr:tt})});toast(t('rule_added'),'ok');loadKeys();
+    body:JSON.stringify({listen_addr:l,target_addr:tt,protocol:prot})});toast(t('rule_added'),'ok');loadKeys();
   }catch(e){toast(e.message,'err')}
 }
 

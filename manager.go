@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ type ForwardRule struct {
 	ID         string `json:"id"`
 	ListenAddr string `json:"listen_addr"`
 	TargetAddr string `json:"target_addr"`
+	Protocol   string `json:"protocol,omitempty"` // "tcp" (default) or "udp"
 }
 
 type KeyConfig struct {
@@ -205,6 +207,7 @@ func (m *Manager) rebuildIndex() {
 		for _, r := range kc.Rules {
 			r.ListenAddr = normalizeListenAddr(r.ListenAddr)
 			r.TargetAddr = normalizeTargetAddr(r.TargetAddr)
+			r.Protocol = normalizeProtocol(r.Protocol)
 		}
 	}
 }
@@ -217,7 +220,7 @@ func (m *Manager) ValidateKey(hash [16]byte) *KeyConfig {
 	return m.byHash[hash]
 }
 
-func (m *Manager) IsRuleAllowed(hash [16]byte, listenAddr, targetAddr string) bool {
+func (m *Manager) IsRuleAllowed(hash [16]byte, listenAddr, targetAddr, protocol string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	kc := m.byHash[hash]
@@ -229,8 +232,9 @@ func (m *Manager) IsRuleAllowed(hash [16]byte, listenAddr, targetAddr string) bo
 	}
 	listenAddr = normalizeListenAddr(listenAddr)
 	targetAddr = normalizeTargetAddr(targetAddr)
+	protocol = normalizeProtocol(protocol)
 	for _, r := range kc.Rules {
-		if r.ListenAddr == listenAddr && r.TargetAddr == targetAddr {
+		if r.ListenAddr == listenAddr && r.TargetAddr == targetAddr && r.Protocol == protocol {
 			return true
 		}
 	}
@@ -259,7 +263,7 @@ func (m *Manager) EnsureKey(key, name string) *KeyConfig {
 	return kc
 }
 
-func (m *Manager) AddKey(key, name, listenAddr, targetAddr string) (*KeyConfig, error) {
+func (m *Manager) AddKey(key, name, listenAddr, targetAddr, protocol string) (*KeyConfig, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -269,9 +273,10 @@ func (m *Manager) AddKey(key, name, listenAddr, targetAddr string) (*KeyConfig, 
 	}
 	listenAddr = normalizeListenAddr(listenAddr)
 	targetAddr = normalizeTargetAddr(targetAddr)
+	protocol = normalizeProtocol(protocol)
 	kc := &KeyConfig{ID: randID(), Key: key, Name: name, Hash: hash}
 	if listenAddr != "" && targetAddr != "" {
-		kc.Rules = []*ForwardRule{{ID: randID(), ListenAddr: listenAddr, TargetAddr: targetAddr}}
+		kc.Rules = []*ForwardRule{{ID: randID(), ListenAddr: listenAddr, TargetAddr: targetAddr, Protocol: protocol}}
 	}
 	m.keys = append(m.keys, kc)
 	m.byHash[hash] = kc
@@ -294,20 +299,21 @@ func (m *Manager) RemoveKey(id string) error {
 	return fmt.Errorf("key not found")
 }
 
-func (m *Manager) AddRule(keyID, listenAddr, targetAddr string) (*ForwardRule, error) {
+func (m *Manager) AddRule(keyID, listenAddr, targetAddr, protocol string) (*ForwardRule, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	listenAddr = normalizeListenAddr(listenAddr)
 	targetAddr = normalizeTargetAddr(targetAddr)
+	protocol = normalizeProtocol(protocol)
 	for _, kc := range m.keys {
 		if kc.ID == keyID {
 			for _, r := range kc.Rules {
-				if r.ListenAddr == listenAddr && r.TargetAddr == targetAddr {
+				if r.ListenAddr == listenAddr && r.TargetAddr == targetAddr && r.Protocol == protocol {
 					return nil, fmt.Errorf("rule already exists")
 				}
 			}
-			r := &ForwardRule{ID: randID(), ListenAddr: listenAddr, TargetAddr: targetAddr}
+			r := &ForwardRule{ID: randID(), ListenAddr: listenAddr, TargetAddr: targetAddr, Protocol: protocol}
 			kc.Rules = append(kc.Rules, r)
 			m.saveLocked()
 			return r, nil
@@ -383,4 +389,18 @@ func randID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func normalizeProtocol(p string) string {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "udp":
+		return "udp"
+	default:
+		return "tcp"
+	}
+}
+
+// ListenerMapKey returns a stable map key for server listener bookkeeping (proto + listen address).
+func ListenerMapKey(protocol, listenAddr string) string {
+	return normalizeProtocol(protocol) + "/" + normalizeListenAddr(listenAddr)
 }

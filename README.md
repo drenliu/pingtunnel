@@ -1,12 +1,12 @@
 # PingTunnel
 
-TCP port forwarding over the ICMP (Ping) protocol. Encapsulates TCP traffic inside ICMP Echo Request/Reply packets, enabling network access through firewalls that only allow Ping.
+TCP and UDP port forwarding over the ICMP (Ping) protocol. Encapsulates TCP or UDP traffic inside ICMP Echo Request/Reply packets, enabling network access through firewalls that only allow Ping.
 
 [中文文档](README_CN.md)
 
 ## Features
 
-- **ICMP Tunneling** — TCP traffic wrapped in Ping packets, bypassing TCP/UDP firewall restrictions
+- **ICMP Tunneling** — TCP or UDP traffic wrapped in Ping packets, bypassing typical firewall restrictions on direct traffic
 - **Reliable Transport** — Sequence numbers, ACKs, automatic retransmission, and out-of-order buffering for lossy networks
 - **Web Management** — Built-in Web UI for managing tunnel keys and port forwarding rules
 - **Authentication** — Web UI secured with admin login and session-based auth
@@ -49,11 +49,12 @@ Use the Web UI to add tunnel keys and forwarding rules:
 - **Key** — Authentication key used by clients to connect
 - **Listen Address** — Port the server listens on (e.g. `4455` or `:4455`)
 - **Target Address** — Destination the client forwards traffic to (e.g. `192.168.33.1:22`)
+- **Protocol** — `TCP` (default) or `UDP`; TCP and UDP may use the same listen port as separate rules
 
 ### Client
 
 ```bash
-sudo ./pingtunnel -type client -l <listen_addr> -s <server_ip> -t <target_addr> -key <tunnel_key>
+sudo ./pingtunnel -type client -l <listen_addr> -s <server_ip> -t <target_addr> -key <tunnel_key> [-protocol tcp|udp]
 ```
 
 | Flag | Description |
@@ -62,18 +63,19 @@ sudo ./pingtunnel -type client -l <listen_addr> -s <server_ip> -t <target_addr> 
 | `-s` | Server ICMP address (server's public IP) |
 | `-t` | Forward target address (matches the server rule's Target Address) |
 | `-key` | Tunnel authentication key (configured on the server via Web UI) |
+| `-protocol` | `tcp` (default) or `udp`; must match the rule’s protocol on the server |
 
 ## Example
 
 ### Scenario: SSH to an internal machine via ICMP tunnel
 
-**1. Server (public IP: 120.46.204.235)**
+**1. Server (public IP: 120.120.120.120)**
 
 ```bash
 sudo ./pingtunnel -type server -key admin123
 ```
 
-Open `http://120.46.204.235:8080`, log in, and add a rule:
+Open `http://120.120.120.120:8080`, log in, and add a rule:
 - Key: `office-ssh`
 - Listen: `4455`
 - Target: `192.168.33.1:22`
@@ -99,8 +101,8 @@ Traffic path: `SSH Client → Server:4455 → ICMP Tunnel → Internal Client �
 ```
 ├── main.go          # CLI entry point and flag parsing
 ├── protocol.go      # ICMP tunnel protocol definition and encoding
-├── server.go        # Server: ICMP listener, TCP forwarding
-├── client.go        # Client: ICMP tunnel connection, TCP forwarding
+├── server.go        # Server: ICMP listener, TCP/UDP forwarding
+├── client.go        # Client: ICMP tunnel connection, TCP/UDP forwarding
 ├── reliable.go      # Reliable transport: seq numbers, ACK, retransmit, reordering
 ├── manager.go       # Key/rule management, traffic stats, config persistence
 ├── web.go           # Web HTTP server, API handlers, session auth

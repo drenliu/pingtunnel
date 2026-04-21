@@ -20,9 +20,11 @@ type Server struct {
 	clientAddr net.Addr
 	clientMu   sync.RWMutex
 
-	listeners   map[string]net.Listener
-	connections map[uint32]*ServerConn
-	nextConnID  uint32
+	listenersTCP map[string]net.Listener
+	listenersUDP map[string]*net.UDPConn
+	udpSessions  map[string]*ServerConn // key: listenAddr|remoteUDP
+	connections  map[uint32]*ServerConn
+	nextConnID   uint32
 
 	sendQueue chan *TunnelPacket
 
@@ -40,7 +42,11 @@ type Server struct {
 
 type ServerConn struct {
 	id         uint32
+	proto      string // "tcp" or "udp"
 	tcpConn    net.Conn
+	udpSock    *net.UDPConn
+	udpRemote  *net.UDPAddr
+	udpSessKey string
 	targetAddr string
 	keyHash    [16]byte
 	closed     int32
@@ -48,15 +54,24 @@ type ServerConn struct {
 	readyOnce  sync.Once
 	reliSend   *ReliableSend
 	reliRecv   *ReliableRecv
+
+	udpMu      sync.Mutex
+	udpReady   bool
+	udpPending [][]byte
+
+	idleMu    sync.Mutex
+	idleTimer *time.Timer
 }
 
 func NewServer(mgr *Manager) *Server {
 	return &Server{
-		manager:     mgr,
-		listeners:   make(map[string]net.Listener),
-		connections: make(map[uint32]*ServerConn),
-		sendQueue:   make(chan *TunnelPacket, 4096),
-		done:        make(chan struct{}),
+		manager:      mgr,
+		listenersTCP: make(map[string]net.Listener),
+		listenersUDP: make(map[string]*net.UDPConn),
+		udpSessions:  make(map[string]*ServerConn),
+		connections:  make(map[uint32]*ServerConn),
+		sendQueue:    make(chan *TunnelPacket, 4096),
+		done:         make(chan struct{}),
 	}
 }
 
@@ -69,12 +84,18 @@ func (s *Server) Close() {
 		s.icmpConn.Close()
 	}
 	s.mu.Lock()
-	for _, l := range s.listeners {
+	for _, l := range s.listenersTCP {
 		l.Close()
+	}
+	for _, u := range s.listenersUDP {
+		u.Close()
 	}
 	for _, sc := range s.connections {
 		if atomic.CompareAndSwapInt32(&sc.closed, 0, 1) {
-			sc.tcpConn.Close()
+			if sc.tcpConn != nil {
+				sc.tcpConn.Close()
+			}
+			sc.stopIdleTimer()
 			sc.reliSend.Close()
 			sc.reliRecv.Close()
 		}
@@ -189,33 +210,47 @@ func (s *Server) handlePacket(pkt *TunnelPacket) {
 }
 
 func (s *Server) handleSetup(pkt *TunnelPacket) {
-	parts := bytes.SplitN(pkt.Data, []byte("|"), 2)
-	if len(parts) != 2 {
+	parts := bytes.Split(pkt.Data, []byte("|"))
+	if len(parts) < 2 {
 		log.Println("[server] bad setup payload")
 		return
 	}
 	listenAddr := normalizeListenAddr(string(parts[0]))
 	targetAddr := normalizeTargetAddr(string(parts[1]))
+	protocol := "tcp"
+	if len(parts) >= 3 {
+		protocol = normalizeProtocol(string(parts[2]))
+	}
 
-	if !s.manager.IsRuleAllowed(pkt.KeyHash, listenAddr, targetAddr) {
+	if !s.manager.IsRuleAllowed(pkt.KeyHash, listenAddr, targetAddr, protocol) {
 		kc := s.manager.ValidateKey(pkt.KeyHash)
 		keyInfo := "unknown"
 		if kc != nil {
 			keyInfo = kc.Name + " (key=" + kc.Key + ")"
 		}
-		log.Printf("[server] setup rejected: %s -> %s key=%s (not allowed)", listenAddr, targetAddr, keyInfo)
+		log.Printf("[server] setup rejected: %s -> %s (%s) key=%s (not allowed)", listenAddr, targetAddr, protocol, keyInfo)
 		return
 	}
 
+	mapKey := ListenerMapKey(protocol, listenAddr)
 	s.mu.RLock()
-	_, exists := s.listeners[listenAddr]
+	exists := false
+	if protocol == "udp" {
+		_, exists = s.listenersUDP[mapKey]
+	} else {
+		_, exists = s.listenersTCP[mapKey]
+	}
 	s.mu.RUnlock()
 
 	if !exists {
-		go s.startTCPListener(listenAddr, targetAddr, pkt.KeyHash)
+		if protocol == "udp" {
+			go s.startUDPListener(listenAddr, targetAddr, pkt.KeyHash)
+		} else {
+			go s.startTCPListener(listenAddr, targetAddr, pkt.KeyHash)
+		}
 	}
 	s.enqueue(&TunnelPacket{Cmd: CmdSetupAck})
-	log.Printf("[server] tunnel setup: listen=%s target=%s", listenAddr, targetAddr)
+	log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s", listenAddr, targetAddr, protocol)
 }
 
 func (s *Server) handleConnectAck(pkt *TunnelPacket) {
@@ -259,10 +294,18 @@ func (s *Server) handleClose(pkt *TunnelPacket) {
 	}
 	s.mu.Unlock()
 	if ok && atomic.CompareAndSwapInt32(&sc.closed, 0, 1) {
-		sc.tcpConn.Close()
+		sc.stopIdleTimer()
+		if sc.tcpConn != nil {
+			sc.tcpConn.Close()
+		}
 		sc.reliSend.Close()
 		sc.reliRecv.Close()
 		sc.readyOnce.Do(func() { close(sc.ready) })
+		if sc.udpSessKey != "" {
+			s.mu.Lock()
+			delete(s.udpSessions, sc.udpSessKey)
+			s.mu.Unlock()
+		}
 		log.Printf("[server] conn %d closed by client", pkt.ConnID)
 	}
 }
@@ -273,11 +316,21 @@ func (s *Server) StartConfiguredListeners() {
 	keys := s.manager.GetKeys()
 	for _, kc := range keys {
 		for _, r := range kc.Rules {
+			mapKey := ListenerMapKey(r.Protocol, r.ListenAddr)
 			s.mu.RLock()
-			_, exists := s.listeners[r.ListenAddr]
+			var exists bool
+			if r.Protocol == "udp" {
+				_, exists = s.listenersUDP[mapKey]
+			} else {
+				_, exists = s.listenersTCP[mapKey]
+			}
 			s.mu.RUnlock()
 			if !exists {
-				go s.startTCPListener(r.ListenAddr, r.TargetAddr, kc.Hash)
+				if r.Protocol == "udp" {
+					go s.startUDPListener(r.ListenAddr, r.TargetAddr, kc.Hash)
+				} else {
+					go s.startTCPListener(r.ListenAddr, r.TargetAddr, kc.Hash)
+				}
 			}
 		}
 	}
@@ -291,8 +344,14 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 		log.Printf("[server] listen %s: %v", listenAddr, err)
 		return
 	}
+	mapKey := ListenerMapKey("tcp", listenAddr)
 	s.mu.Lock()
-	s.listeners[listenAddr] = ln
+	if _, exists := s.listenersTCP[mapKey]; exists {
+		s.mu.Unlock()
+		ln.Close()
+		return
+	}
+	s.listenersTCP[mapKey] = ln
 	s.mu.Unlock()
 
 	log.Printf("[server] TCP listening on %s", listenAddr)
@@ -310,6 +369,7 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 		connID := atomic.AddUint32(&s.nextConnID, 1)
 		sc := &ServerConn{
 			id:         connID,
+			proto:      "tcp",
 			tcpConn:    tc,
 			targetAddr: targetAddr,
 			keyHash:    keyHash,
@@ -336,6 +396,110 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 	}
 }
 
+func (s *Server) startUDPListener(listenAddr, targetAddr string, keyHash [16]byte) {
+	pc, err := net.ListenPacket("udp", listenAddr)
+	if err != nil {
+		log.Printf("[server] UDP listen %s: %v", listenAddr, err)
+		return
+	}
+	uc, ok := pc.(*net.UDPConn)
+	if !ok {
+		pc.Close()
+		log.Printf("[server] UDP listen %s: unexpected conn type", listenAddr)
+		return
+	}
+	mapKey := ListenerMapKey("udp", listenAddr)
+	s.mu.Lock()
+	if _, exists := s.listenersUDP[mapKey]; exists {
+		s.mu.Unlock()
+		uc.Close()
+		return
+	}
+	s.listenersUDP[mapKey] = uc
+	s.mu.Unlock()
+
+	log.Printf("[server] UDP listening on %s", listenAddr)
+
+	s.udpReadLoop(uc, listenAddr, targetAddr, keyHash)
+
+	s.mu.Lock()
+	delete(s.listenersUDP, mapKey)
+	s.mu.Unlock()
+	uc.Close()
+	log.Printf("[server] UDP listener stopped %s", listenAddr)
+}
+
+func (s *Server) udpReadLoop(uc *net.UDPConn, listenAddr, targetAddr string, keyHash [16]byte) {
+	buf := make([]byte, 65535)
+	for atomic.LoadInt32(&s.closed) == 0 {
+		uc.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := uc.ReadFrom(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			if atomic.LoadInt32(&s.closed) != 0 {
+				return
+			}
+			log.Printf("[server] UDP read %s: %v", listenAddr, err)
+			return
+		}
+		ra, ok := addr.(*net.UDPAddr)
+		if !ok || n <= 0 {
+			continue
+		}
+		sessKey := listenAddr + "|" + ra.String()
+
+		s.mu.Lock()
+		sc, exists := s.udpSessions[sessKey]
+		if exists {
+			s.mu.Unlock()
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			sc.queueUDPFromUser(s, data)
+			continue
+		}
+
+		connID := atomic.AddUint32(&s.nextConnID, 1)
+		sc = &ServerConn{
+			id:         connID,
+			proto:      "udp",
+			udpSock:    uc,
+			udpRemote:  ra,
+			udpSessKey: sessKey,
+			targetAddr: targetAddr,
+			keyHash:    keyHash,
+			ready:      make(chan struct{}),
+		}
+		sc.reliSend = NewReliableSend(connID, s.enqueue)
+		sc.reliRecv = NewReliableRecv(connID,
+			func(data []byte) error {
+				_, werr := sc.udpSock.WriteTo(data, sc.udpRemote)
+				if werr == nil {
+					sc.resetUDPIdle(s)
+				}
+				return werr
+			},
+			s.enqueue,
+		)
+		s.udpSessions[sessKey] = sc
+		s.connections[connID] = sc
+		s.mu.Unlock()
+
+		log.Printf("[server] UDP conn %d from %s", connID, ra.String())
+		s.enqueue(&TunnelPacket{
+			Cmd:    CmdConnect,
+			ConnID: connID,
+			Data:   []byte(targetAddr),
+		})
+		go s.waitReady(sc)
+
+		data := make([]byte, n)
+		copy(data, buf[:n])
+		sc.queueUDPFromUser(s, data)
+	}
+}
+
 func (s *Server) waitReady(sc *ServerConn) {
 	retry := time.NewTicker(time.Second)
 	defer retry.Stop()
@@ -345,6 +509,10 @@ func (s *Server) waitReady(sc *ServerConn) {
 	for {
 		select {
 		case <-sc.ready:
+			if sc.proto == "udp" {
+				sc.flushUDPPending(s)
+				return
+			}
 			go s.readTCP(sc)
 			return
 		case <-retry.C:
@@ -386,13 +554,19 @@ func (s *Server) closeConn(sc *ServerConn) {
 	if !atomic.CompareAndSwapInt32(&sc.closed, 0, 1) {
 		return
 	}
-	sc.tcpConn.Close()
+	sc.stopIdleTimer()
+	if sc.tcpConn != nil {
+		sc.tcpConn.Close()
+	}
 	sc.reliSend.Close()
 	sc.reliRecv.Close()
 	sc.readyOnce.Do(func() { close(sc.ready) })
 
 	s.mu.Lock()
 	delete(s.connections, sc.id)
+	if sc.udpSessKey != "" {
+		delete(s.udpSessions, sc.udpSessKey)
+	}
 	s.mu.Unlock()
 
 	s.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: sc.id})
@@ -418,6 +592,8 @@ func (s *Server) GetConnsByKey() map[[16]byte][]ConnInfo {
 		}
 		if sc.tcpConn != nil {
 			ci.ClientAddr = sc.tcpConn.RemoteAddr().String()
+		} else if sc.udpRemote != nil {
+			ci.ClientAddr = "udp:" + sc.udpRemote.String()
 		}
 		m[sc.keyHash] = append(m[sc.keyHash], ci)
 	}
@@ -468,5 +644,57 @@ func (s *Server) enqueue(pkt *TunnelPacket) {
 	case s.sendQueue <- pkt:
 	default:
 		log.Println("[server] send queue full, dropping")
+	}
+}
+
+func (sc *ServerConn) queueUDPFromUser(s *Server, data []byte) {
+	sc.udpMu.Lock()
+	if sc.udpReady {
+		sc.udpMu.Unlock()
+		s.manager.RecordOut(sc.keyHash, len(data))
+		sc.reliSend.Send(data)
+		sc.resetUDPIdle(s)
+		return
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	sc.udpPending = append(sc.udpPending, cp)
+	sc.udpMu.Unlock()
+}
+
+func (sc *ServerConn) flushUDPPending(s *Server) {
+	sc.udpMu.Lock()
+	sc.udpReady = true
+	pending := sc.udpPending
+	sc.udpPending = nil
+	sc.udpMu.Unlock()
+	for _, p := range pending {
+		s.manager.RecordOut(sc.keyHash, len(p))
+		sc.reliSend.Send(p)
+	}
+	sc.resetUDPIdle(s)
+}
+
+func (sc *ServerConn) resetUDPIdle(s *Server) {
+	if sc.proto != "udp" {
+		return
+	}
+	sc.idleMu.Lock()
+	defer sc.idleMu.Unlock()
+	if sc.idleTimer != nil {
+		sc.idleTimer.Stop()
+	}
+	sc.idleTimer = time.AfterFunc(5*time.Minute, func() {
+		log.Printf("[server] conn %d: UDP idle timeout", sc.id)
+		s.closeConn(sc)
+	})
+}
+
+func (sc *ServerConn) stopIdleTimer() {
+	sc.idleMu.Lock()
+	defer sc.idleMu.Unlock()
+	if sc.idleTimer != nil {
+		sc.idleTimer.Stop()
+		sc.idleTimer = nil
 	}
 }

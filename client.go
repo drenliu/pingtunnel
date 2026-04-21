@@ -16,6 +16,7 @@ type Client struct {
 	listenAddr string
 	serverAddr string
 	targetAddr string
+	protocol   string
 	key        [16]byte
 
 	icmpConn *icmp.PacketConn
@@ -34,16 +35,21 @@ type Client struct {
 
 type ClientConn struct {
 	id       uint32
-	tcpConn  net.Conn
+	proto    string
+	tcpConn  net.Conn // TCP stream or UDP datagram socket (implements net.Conn)
 	reliSend *ReliableSend
 	reliRecv *ReliableRecv
+
+	idleMu    sync.Mutex
+	idleTimer *time.Timer
 }
 
-func NewClient(listenAddr, serverAddr, targetAddr, key string) *Client {
+func NewClient(listenAddr, serverAddr, targetAddr, key, protocol string) *Client {
 	return &Client{
 		listenAddr:  listenAddr,
 		serverAddr:  serverAddr,
 		targetAddr:  targetAddr,
+		protocol:    normalizeProtocol(protocol),
 		key:         ComputeKeyHash(key),
 		connections: make(map[uint32]*ClientConn),
 		pending:     make(map[uint32]bool),
@@ -63,6 +69,7 @@ func (c *Client) Close() {
 	}
 	c.mu.Lock()
 	for _, cc := range c.connections {
+		cc.stopIdleTimer()
 		cc.tcpConn.Close()
 		cc.reliSend.Close()
 		cc.reliRecv.Close()
@@ -97,8 +104,8 @@ func (c *Client) Run() error {
 
 	select {
 	case <-c.setupDone:
-		log.Printf("[client] tunnel ready: %s listens on %s, target %s",
-			c.serverAddr, c.listenAddr, c.targetAddr)
+		log.Printf("[client] tunnel ready: %s listens on %s, target %s (%s)",
+			c.serverAddr, c.listenAddr, c.targetAddr, c.protocol)
 	case <-time.After(30 * time.Second):
 		return fmt.Errorf("setup timeout (check -key and server status)")
 	case <-c.done:
@@ -110,7 +117,7 @@ func (c *Client) Run() error {
 }
 
 func (c *Client) sendSetup() {
-	data := fmt.Sprintf("%s|%s", c.listenAddr, c.targetAddr)
+	data := fmt.Sprintf("%s|%s|%s", c.listenAddr, c.targetAddr, c.protocol)
 	for i := 0; i < 30; i++ {
 		select {
 		case <-c.setupDone:
@@ -248,9 +255,13 @@ func (c *Client) handleConnect(pkt *TunnelPacket) {
 		target = c.targetAddr
 	}
 
-	log.Printf("[client] conn %d: dialing %s", pkt.ConnID, target)
+	log.Printf("[client] conn %d: dialing %s (%s)", pkt.ConnID, target, c.protocol)
 
-	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	network := "tcp"
+	if c.protocol == "udp" {
+		network = "udp"
+	}
+	conn, err := net.DialTimeout(network, target, 10*time.Second)
 	if err != nil {
 		log.Printf("[client] conn %d: dial failed: %v", pkt.ConnID, err)
 		c.mu.Lock()
@@ -260,12 +271,15 @@ func (c *Client) handleConnect(pkt *TunnelPacket) {
 		return
 	}
 
-	cc := &ClientConn{id: pkt.ConnID, tcpConn: conn}
+	cc := &ClientConn{id: pkt.ConnID, proto: c.protocol, tcpConn: conn}
 	cc.reliSend = NewReliableSend(pkt.ConnID, c.enqueue)
 	cc.reliRecv = NewReliableRecv(pkt.ConnID,
 		func(data []byte) error {
-			_, err := conn.Write(data)
-			return err
+			_, werr := conn.Write(data)
+			if werr == nil && c.protocol == "udp" {
+				cc.resetUDPIdle(c)
+			}
+			return werr
 		},
 		c.enqueue,
 	)
@@ -278,6 +292,9 @@ func (c *Client) handleConnect(pkt *TunnelPacket) {
 	c.enqueue(&TunnelPacket{Cmd: CmdConnectAck, ConnID: pkt.ConnID})
 	log.Printf("[client] conn %d: established to %s", pkt.ConnID, target)
 
+	if c.protocol == "udp" {
+		cc.resetUDPIdle(c)
+	}
 	go c.readTarget(cc)
 }
 
@@ -286,6 +303,7 @@ func (c *Client) readTarget(cc *ClientConn) {
 		c.mu.Lock()
 		delete(c.connections, cc.id)
 		c.mu.Unlock()
+		cc.stopIdleTimer()
 		cc.tcpConn.Close()
 		cc.reliSend.Close()
 		cc.reliRecv.Close()
@@ -300,6 +318,9 @@ func (c *Client) readTarget(cc *ClientConn) {
 			return
 		}
 		if n > 0 {
+			if cc.proto == "udp" {
+				cc.resetUDPIdle(c)
+			}
 			data := make([]byte, n)
 			copy(data, buf[:n])
 			if !cc.reliSend.Send(data) {
@@ -321,6 +342,7 @@ func (c *Client) handleData(pkt *TunnelPacket) {
 		c.mu.Lock()
 		delete(c.connections, pkt.ConnID)
 		c.mu.Unlock()
+		cc.stopIdleTimer()
 		cc.tcpConn.Close()
 		cc.reliSend.Close()
 		cc.reliRecv.Close()
@@ -345,10 +367,35 @@ func (c *Client) handleCloseCmd(pkt *TunnelPacket) {
 	}
 	c.mu.Unlock()
 	if ok {
+		cc.stopIdleTimer()
 		cc.tcpConn.Close()
 		cc.reliSend.Close()
 		cc.reliRecv.Close()
 		log.Printf("[client] conn %d: closed by server", pkt.ConnID)
+	}
+}
+
+func (cc *ClientConn) resetUDPIdle(c *Client) {
+	if cc.proto != "udp" {
+		return
+	}
+	cc.idleMu.Lock()
+	defer cc.idleMu.Unlock()
+	if cc.idleTimer != nil {
+		cc.idleTimer.Stop()
+	}
+	cc.idleTimer = time.AfterFunc(5*time.Minute, func() {
+		log.Printf("[client] conn %d: UDP idle timeout", cc.id)
+		cc.tcpConn.Close()
+	})
+}
+
+func (cc *ClientConn) stopIdleTimer() {
+	cc.idleMu.Lock()
+	defer cc.idleMu.Unlock()
+	if cc.idleTimer != nil {
+		cc.idleTimer.Stop()
+		cc.idleTimer = nil
 	}
 }
 

@@ -135,9 +135,12 @@ func (ws *webServer) authenticated(r *http.Request) bool {
 func (ws *webServer) apiStatus(w http.ResponseWriter) {
 	s := ws.srv
 	s.mu.RLock()
-	listeners := make([]string, 0, len(s.listeners))
-	for addr := range s.listeners {
-		listeners = append(listeners, addr)
+	listeners := make([]string, 0, len(s.listenersTCP)+len(s.listenersUDP))
+	for k := range s.listenersTCP {
+		listeners = append(listeners, k)
+	}
+	for k := range s.listenersUDP {
+		listeners = append(listeners, k)
 	}
 	conns := len(s.connections)
 	s.mu.RUnlock()
@@ -207,6 +210,7 @@ func (ws *webServer) apiAddKey(w http.ResponseWriter, r *http.Request) {
 		Name       string `json:"name"`
 		ListenAddr string `json:"listen_addr"`
 		TargetAddr string `json:"target_addr"`
+		Protocol   string `json:"protocol"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonErr(w, "invalid JSON", 400)
@@ -219,7 +223,7 @@ func (ws *webServer) apiAddKey(w http.ResponseWriter, r *http.Request) {
 	if req.Name == "" {
 		req.Name = "Unnamed"
 	}
-	kc, err := ws.mgr.AddKey(req.Key, req.Name, req.ListenAddr, req.TargetAddr)
+	kc, err := ws.mgr.AddKey(req.Key, req.Name, req.ListenAddr, req.TargetAddr, req.Protocol)
 	if err != nil {
 		jsonErr(w, err.Error(), 400)
 		return
@@ -244,6 +248,7 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 		var req struct {
 			ListenAddr string `json:"listen_addr"`
 			TargetAddr string `json:"target_addr"`
+			Protocol   string `json:"protocol"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			jsonErr(w, "invalid JSON", 400)
@@ -253,7 +258,7 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 			jsonErr(w, "listen_addr and target_addr are required", 400)
 			return
 		}
-		rule, err := ws.mgr.AddRule(parts[0], req.ListenAddr, req.TargetAddr)
+		rule, err := ws.mgr.AddRule(parts[0], req.ListenAddr, req.TargetAddr, req.Protocol)
 		if err != nil {
 			jsonErr(w, err.Error(), 400)
 			return
