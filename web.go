@@ -15,19 +15,11 @@ import (
 var webHTML string
 
 type StatusInfo struct {
-	ICMPIn      uint64           `json:"icmp_in"`
-	ICMPOut     uint64           `json:"icmp_out"`
-	BadKey      uint64           `json:"bad_key"`
-	ActiveConns int              `json:"active_conns"`
-	Listeners   []string         `json:"listeners"`
-	ICMPPeers   []ICMPPeerStatus `json:"icmp_peers"`
-	ClientAddr  string           `json:"client_addr,omitempty"` // first peer; deprecated, use icmp_peers
-}
-
-// ICMPPeerStatus is one tunnel client (ICMP echo source) seen for a given key.
-type ICMPPeerStatus struct {
-	KeyName string `json:"key_name"`
-	Addr    string `json:"addr"`
+	ICMPIn      uint64   `json:"icmp_in"`
+	ICMPOut     uint64   `json:"icmp_out"`
+	BadKey      uint64   `json:"bad_key"`
+	ActiveConns int      `json:"active_conns"`
+	Listeners   []string `json:"listeners"`
 }
 
 func StartWeb(addr, password string, mgr *Manager, srv *Server) {
@@ -140,6 +132,7 @@ func (ws *webServer) authenticated(r *http.Request) bool {
 // ── api handlers ──
 
 func (ws *webServer) apiStatus(w http.ResponseWriter) {
+	ws.srv.pruneStaleICMPPeers()
 	s := ws.srv
 	s.mu.RLock()
 	listeners := make([]string, 0, len(s.listenersTCP)+len(s.listenersUDP))
@@ -152,55 +145,32 @@ func (ws *webServer) apiStatus(w http.ResponseWriter) {
 	conns := len(s.connections)
 	s.mu.RUnlock()
 
-	peers := ws.buildICMPPeers()
-
 	json.NewEncoder(w).Encode(StatusInfo{
 		ICMPIn:      atomic.LoadUint64(&s.stats.icmpIn),
 		ICMPOut:     atomic.LoadUint64(&s.stats.icmpOut),
 		BadKey:      atomic.LoadUint64(&s.stats.badKey),
 		ActiveConns: conns,
 		Listeners:   listeners,
-		ICMPPeers:   peers,
-		ClientAddr:  firstPeerAddr(peers),
 	})
 }
 
-func (ws *webServer) buildICMPPeers() []ICMPPeerStatus {
-	s := ws.srv
-	s.icmpPeersMu.RLock()
-	defer s.icmpPeersMu.RUnlock()
-	out := make([]ICMPPeerStatus, 0, len(s.icmpPeers))
-	for h, addr := range s.icmpPeers {
-		nm := ""
-		if kc := ws.mgr.ValidateKey(h); kc != nil {
-			nm = kc.Name
-		}
-		out = append(out, ICMPPeerStatus{KeyName: nm, Addr: addr.String()})
-	}
-	return out
-}
-
-func firstPeerAddr(peers []ICMPPeerStatus) string {
-	if len(peers) == 0 {
-		return ""
-	}
-	return peers[0].Addr
-}
-
 func (ws *webServer) apiListKeys(w http.ResponseWriter) {
+	ws.srv.pruneStaleICMPPeers()
 	keys := ws.mgr.GetKeys()
 	connsByKey := ws.srv.GetConnsByKey()
 	type keyResp struct {
-		ID       string         `json:"id"`
-		Key      string         `json:"key"`
-		Name     string         `json:"name"`
-		AllowAll bool           `json:"allow_all"`
-		Rules    []*ForwardRule `json:"rules"`
-		TotalIn  uint64         `json:"total_in"`
-		TotalOut uint64         `json:"total_out"`
-		SpeedIn  uint64         `json:"speed_in"`
-		SpeedOut uint64         `json:"speed_out"`
-		Conns    []ConnInfo     `json:"conns"`
+		ID             string         `json:"id"`
+		Key            string         `json:"key"`
+		Name           string         `json:"name"`
+		AllowAll       bool           `json:"allow_all"`
+		IcmpOnline     bool           `json:"icmp_online"`
+		IcmpClientAddr string         `json:"icmp_client_addr,omitempty"`
+		Rules          []*ForwardRule `json:"rules"`
+		TotalIn        uint64         `json:"total_in"`
+		TotalOut       uint64         `json:"total_out"`
+		SpeedIn        uint64         `json:"speed_in"`
+		SpeedOut       uint64         `json:"speed_out"`
+		Conns          []ConnInfo     `json:"conns"`
 	}
 	resp := make([]keyResp, len(keys))
 	for i, k := range keys {
@@ -214,16 +184,18 @@ func (ws *webServer) apiListKeys(w http.ResponseWriter) {
 			conns = make([]ConnInfo, 0)
 		}
 		resp[i] = keyResp{
-			ID:       k.ID,
-			Key:      k.Key,
-			Name:     k.Name,
-			AllowAll: k.AllowAll,
-			Rules:    rules,
-			TotalIn:  k.TotalIn + sessIn,
-			TotalOut: k.TotalOut + sessOut,
-			SpeedIn:  si,
-			SpeedOut: so,
-			Conns:    conns,
+			ID:             k.ID,
+			Key:            k.Key,
+			Name:           k.Name,
+			AllowAll:       k.AllowAll,
+			IcmpOnline:     ws.srv.IsICMPOnlineForKey(k.Hash),
+			IcmpClientAddr: ws.srv.ICMPClientAddrForKey(k.Hash),
+			Rules:          rules,
+			TotalIn:        k.TotalIn + sessIn,
+			TotalOut:       k.TotalOut + sessOut,
+			SpeedIn:        si,
+			SpeedOut:       so,
+			Conns:          conns,
 		}
 	}
 	json.NewEncoder(w).Encode(resp)

@@ -13,6 +13,9 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
+// icmpClientHeartbeatTTL: if no ICMP from a tunnel key for this long, treat client as offline.
+const icmpClientHeartbeatTTL = 45 * time.Second
+
 type Server struct {
 	manager  *Manager
 	icmpConn *icmp.PacketConn
@@ -23,8 +26,9 @@ type Server struct {
 	sendQueuesMu sync.Mutex
 
 	// Last ICMP source address per authenticated key (for status UI).
-	icmpPeers   map[[16]byte]net.Addr
-	icmpPeersMu sync.RWMutex
+	icmpPeers    map[[16]byte]net.Addr
+	icmpLastSeen map[[16]byte]time.Time
+	icmpPeersMu  sync.RWMutex
 
 	listenersTCP map[string]net.Listener
 	listenersUDP map[string]*net.UDPConn
@@ -72,6 +76,7 @@ func NewServer(mgr *Manager) *Server {
 		manager:      mgr,
 		sendQueues:   make(map[[16]byte]chan *TunnelPacket),
 		icmpPeers:    make(map[[16]byte]net.Addr),
+		icmpLastSeen: make(map[[16]byte]time.Time),
 		listenersTCP: make(map[string]net.Listener),
 		listenersUDP: make(map[string]*net.UDPConn),
 		udpSessions:  make(map[string]*ServerConn),
@@ -115,6 +120,7 @@ func (s *Server) Close() {
 	s.sendQueuesMu.Unlock()
 	s.icmpPeersMu.Lock()
 	s.icmpPeers = make(map[[16]byte]net.Addr)
+	s.icmpLastSeen = make(map[[16]byte]time.Time)
 	s.icmpPeersMu.Unlock()
 }
 
@@ -170,8 +176,10 @@ func (s *Server) Run() error {
 		atomic.AddUint64(&s.stats.icmpIn, 1)
 
 		clientKeyHash := pkt.KeyHash
+		now := time.Now()
 		s.icmpPeersMu.Lock()
 		s.icmpPeers[clientKeyHash] = addr
+		s.icmpLastSeen[clientKeyHash] = now
 		s.icmpPeersMu.Unlock()
 
 		s.handlePacket(pkt)
@@ -611,6 +619,40 @@ func (s *Server) GetConnsByKey() map[[16]byte][]ConnInfo {
 		m[sc.keyHash] = append(m[sc.keyHash], ci)
 	}
 	return m
+}
+
+func (s *Server) pruneStaleICMPPeers() {
+	now := time.Now()
+	s.icmpPeersMu.Lock()
+	for h, t := range s.icmpLastSeen {
+		if now.Sub(t) > icmpClientHeartbeatTTL {
+			delete(s.icmpLastSeen, h)
+			delete(s.icmpPeers, h)
+		}
+	}
+	s.icmpPeersMu.Unlock()
+}
+
+// IsICMPOnlineForKey reports whether a tunnel client has sent ICMP recently for this key.
+func (s *Server) IsICMPOnlineForKey(h [16]byte) bool {
+	s.icmpPeersMu.RLock()
+	defer s.icmpPeersMu.RUnlock()
+	t, ok := s.icmpLastSeen[h]
+	return ok && time.Since(t) <= icmpClientHeartbeatTTL
+}
+
+// ICMPClientAddrForKey returns the last seen ICMP source address for this key, or "" if offline.
+func (s *Server) ICMPClientAddrForKey(h [16]byte) string {
+	s.icmpPeersMu.RLock()
+	defer s.icmpPeersMu.RUnlock()
+	t, ok := s.icmpLastSeen[h]
+	if !ok || time.Since(t) > icmpClientHeartbeatTTL {
+		return ""
+	}
+	if a, ok := s.icmpPeers[h]; ok {
+		return a.String()
+	}
+	return ""
 }
 
 // --------------- background loops ---------------
