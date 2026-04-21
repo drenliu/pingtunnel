@@ -15,12 +15,19 @@ import (
 var webHTML string
 
 type StatusInfo struct {
-	ICMPIn      uint64   `json:"icmp_in"`
-	ICMPOut     uint64   `json:"icmp_out"`
-	BadKey      uint64   `json:"bad_key"`
-	ActiveConns int      `json:"active_conns"`
-	Listeners   []string `json:"listeners"`
-	ClientAddr  string   `json:"client_addr"`
+	ICMPIn      uint64           `json:"icmp_in"`
+	ICMPOut     uint64           `json:"icmp_out"`
+	BadKey      uint64           `json:"bad_key"`
+	ActiveConns int              `json:"active_conns"`
+	Listeners   []string         `json:"listeners"`
+	ICMPPeers   []ICMPPeerStatus `json:"icmp_peers"`
+	ClientAddr  string           `json:"client_addr,omitempty"` // first peer; deprecated, use icmp_peers
+}
+
+// ICMPPeerStatus is one tunnel client (ICMP echo source) seen for a given key.
+type ICMPPeerStatus struct {
+	KeyName string `json:"key_name"`
+	Addr    string `json:"addr"`
 }
 
 func StartWeb(addr, password string, mgr *Manager, srv *Server) {
@@ -145,12 +152,7 @@ func (ws *webServer) apiStatus(w http.ResponseWriter) {
 	conns := len(s.connections)
 	s.mu.RUnlock()
 
-	s.clientMu.RLock()
-	ca := ""
-	if s.clientAddr != nil {
-		ca = s.clientAddr.String()
-	}
-	s.clientMu.RUnlock()
+	peers := ws.buildICMPPeers()
 
 	json.NewEncoder(w).Encode(StatusInfo{
 		ICMPIn:      atomic.LoadUint64(&s.stats.icmpIn),
@@ -158,8 +160,31 @@ func (ws *webServer) apiStatus(w http.ResponseWriter) {
 		BadKey:      atomic.LoadUint64(&s.stats.badKey),
 		ActiveConns: conns,
 		Listeners:   listeners,
-		ClientAddr:  ca,
+		ICMPPeers:   peers,
+		ClientAddr:  firstPeerAddr(peers),
 	})
+}
+
+func (ws *webServer) buildICMPPeers() []ICMPPeerStatus {
+	s := ws.srv
+	s.icmpPeersMu.RLock()
+	defer s.icmpPeersMu.RUnlock()
+	out := make([]ICMPPeerStatus, 0, len(s.icmpPeers))
+	for h, addr := range s.icmpPeers {
+		nm := ""
+		if kc := ws.mgr.ValidateKey(h); kc != nil {
+			nm = kc.Name
+		}
+		out = append(out, ICMPPeerStatus{KeyName: nm, Addr: addr.String()})
+	}
+	return out
+}
+
+func firstPeerAddr(peers []ICMPPeerStatus) string {
+	if len(peers) == 0 {
+		return ""
+	}
+	return peers[0].Addr
 }
 
 func (ws *webServer) apiListKeys(w http.ResponseWriter) {
@@ -207,7 +232,6 @@ func (ws *webServer) apiListKeys(w http.ResponseWriter) {
 func (ws *webServer) apiAddKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Key        string `json:"key"`
-		Name       string `json:"name"`
 		ListenAddr string `json:"listen_addr"`
 		TargetAddr string `json:"target_addr"`
 		Protocol   string `json:"protocol"`
@@ -220,10 +244,7 @@ func (ws *webServer) apiAddKey(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, "key is required", 400)
 		return
 	}
-	if req.Name == "" {
-		req.Name = "Unnamed"
-	}
-	kc, err := ws.mgr.AddKey(req.Key, req.Name, req.ListenAddr, req.TargetAddr, req.Protocol)
+	kc, err := ws.mgr.AddKey(req.Key, req.ListenAddr, req.TargetAddr, req.Protocol)
 	if err != nil {
 		jsonErr(w, err.Error(), 400)
 		return

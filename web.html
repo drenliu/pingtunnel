@@ -165,7 +165,6 @@ td code{font-family:'SF Mono',Consolas,monospace;font-size:13px}
   <div class="modal">
     <h3 data-i18n="modal_title"></h3>
     <div class="fg"><label data-i18n="key"></label><input id="nk" data-ph="ph_key"></div>
-    <div class="fg"><label data-i18n="name"></label><input id="nn" data-ph="ph_name"></div>
     <div style="border-top:1px solid var(--border);margin:16px 0 12px;padding-top:12px">
       <div style="font-size:12px;color:var(--muted);font-weight:600;margin-bottom:8px" data-i18n="port_mapping_hint"></div>
       <div class="fg"><label data-i18n="listen_addr"></label><input id="nl" data-ph="ph_listen"></div>
@@ -189,17 +188,17 @@ const I18N={
     logout:'Logout',
     stat_in:'ICMP In', stat_out:'ICMP Out', stat_conns:'Connections', stat_badkey:'Bad Keys',
     keys_title:'Keys & Forwarding Rules', new_key:'+ New Key', loading:'Loading...',
-    modal_title:'Add Key & Port Mapping', key:'Key', name:'Name',
+    modal_title:'Add Key & Port Mapping', key:'Key',
     port_mapping_hint:'PORT MAPPING (at least one rule required)',
     listen_addr:'Listen Address', target_addr:'Target Address', protocol:'Protocol',
     cancel:'Cancel', add:'Add',
-    ph_key:'e.g. my-secret-key', ph_name:'e.g. Production',
+    ph_key:'e.g. my-secret-key',
     ph_listen:'e.g. :4455', ph_target:'e.g. 192.168.33.1:22',
     ph_listen_add:'Listen, e.g. :4455', ph_target_add:'Target, e.g. 192.168.33.1:22',
     delete:'Delete', listen:'Listen', target:'Target', proto:'Proto', status:'Status',
     active:'Active', idle:'Idle', copy:'Copy', copied:'Copied!',
     total:'Total', active_conns:'Active Connections',
-    icmp_client:'ICMP Client: ', icmp_offline:'ICMP Client: offline',
+    icmp_client:'ICMP tunnel clients (per key)', icmp_offline:'No ICMP client online',
     no_conns:'No active connections',
     hint_allowall:'CLI key — any forwarding allowed.',
     hint_norules:'No port mappings. Client connections will be rejected. Add a rule below.',
@@ -219,17 +218,17 @@ const I18N={
     logout:'退出',
     stat_in:'ICMP 入', stat_out:'ICMP 出', stat_conns:'连接数', stat_badkey:'无效密钥',
     keys_title:'密钥与转发规则', new_key:'+ 新增密钥', loading:'加载中...',
-    modal_title:'添加密钥与端口映射', key:'密钥', name:'名称',
+    modal_title:'添加密钥与端口映射', key:'密钥',
     port_mapping_hint:'端口映射（至少需要一条规则）',
     listen_addr:'监听地址', target_addr:'目标地址', protocol:'协议',
     cancel:'取消', add:'添加',
-    ph_key:'例如 my-secret-key', ph_name:'例如 Production',
+    ph_key:'例如 my-secret-key',
     ph_listen:'例如 :4455', ph_target:'例如 192.168.33.1:22',
     ph_listen_add:'监听地址，例如 :4455', ph_target_add:'目标地址，例如 192.168.33.1:22',
     delete:'删除', listen:'监听', target:'目标', proto:'协议', status:'状态',
     active:'活跃', idle:'空闲', copy:'复制', copied:'已复制!',
     total:'总流量', active_conns:'活跃连接',
-    icmp_client:'ICMP 客户端: ', icmp_offline:'ICMP 客户端: 离线',
+    icmp_client:'ICMP 隧道客户端（按密钥）', icmp_offline:'暂无 ICMP 客户端在线',
     no_conns:'暂无活跃连接',
     hint_allowall:'CLI 密钥 — 允许任意转发。',
     hint_norules:'无端口映射。客户端连接将被拒绝，请在下方添加规则。',
@@ -359,8 +358,9 @@ function render(){
   let h='';
   for(let i=0;i<K.length;i++){
     const k=K[i], rules=k.rules||[];
-    h+='<div class="card"><div class="card-hd"><div><span class="name">'+esc(k.name||'Unnamed')+'</span>'
-      +'<code>'+esc(k.key)+'</code></div>'
+    h+='<div class="card"><div class="card-hd"><div>'+(k.name&&k.name.trim()
+      ?'<span class="name">'+esc(k.name)+'</span><code>'+esc(k.key)+'</code>'
+      :'<span class="name"><code>'+esc(k.key)+'</code></span>')+'</div>'
       +'<div class="acts"><button class="btn btn-d btn-s" onclick="delKey(\''+k.id+'\')">'+t('delete')+'</button></div></div>';
 
     h+='<div class="card-traffic">'
@@ -394,12 +394,21 @@ function render(){
     h+='</tbody></table>';
 
     const conns=k.conns||[];
-    const ca=S.client_addr||'';
+    const peers=S.icmp_peers||[];
     h+='<div class="conns-section">';
     h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
       +'<div class="conns-title" style="margin-bottom:0">'+t('active_conns')+' ('+conns.length+')</div>';
-    if(ca){h+='<div style="font-size:12px"><span style="color:var(--muted)">'+t('icmp_client')+'</span><code style="font-size:12px;color:var(--success)">'+esc(ca)+'</code></div>';}
-    else{h+='<div style="font-size:12px;color:var(--muted)">'+esc(t('icmp_offline'))+'</div>';}
+    h+='<div style="font-size:11px;color:var(--muted);margin-bottom:6px">'+esc(t('icmp_client'))+'</div>';
+    if(peers.length){
+      for(let p=0;p<peers.length;p++){
+        const peer=peers[p];
+        const nm=(peer.key_name&&peer.key_name.trim())?peer.key_name:'—';
+        h+='<div style="font-size:12px;margin-bottom:4px"><code style="font-size:12px;color:var(--success)">'+esc(peer.addr)+'</code>'
+          +' <span style="color:var(--muted)">('+esc(nm)+')</span></div>';
+      }
+    }else{
+      h+='<div style="font-size:12px;color:var(--muted);margin-bottom:8px">'+esc(t('icmp_offline'))+'</div>';
+    }
     h+='</div>';
     if(conns.length){
       for(let c=0;c<conns.length;c++){
@@ -427,14 +436,14 @@ function showModal(){$('dlg').classList.add('show');$('nk').focus()}
 function hideModal(){$('dlg').classList.remove('show')}
 
 async function addKey(){
-  const key=$('nk').value.trim(), name=$('nn').value.trim()||'Unnamed';
+  const key=$('nk').value.trim();
   const listen=$('nl').value.trim(), target=$('nt').value.trim();
   if(!key){toast(t('key_required'),'err');return}
   if(!listen||!target){toast(t('mapping_required'),'err');return}
   const prot=$('nproto').value||'tcp';
   try{await api('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key,name,listen_addr:listen,target_addr:target,protocol:prot})});
-    $('nk').value='';$('nn').value='';$('nl').value='';$('nt').value='';$('nproto').value='tcp';
+    body:JSON.stringify({key,listen_addr:listen,target_addr:target,protocol:prot})});
+    $('nk').value='';$('nl').value='';$('nt').value='';$('nproto').value='tcp';
     hideModal();toast(t('key_added'),'ok');loadKeys();
   }catch(e){toast(e.message,'err')}
 }

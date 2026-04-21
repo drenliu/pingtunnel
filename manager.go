@@ -249,7 +249,7 @@ func (m *Manager) GetKeys() []*KeyConfig {
 	return out
 }
 
-func (m *Manager) EnsureKey(key, name string) *KeyConfig {
+func (m *Manager) EnsureKey(key string) *KeyConfig {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -257,13 +257,13 @@ func (m *Manager) EnsureKey(key, name string) *KeyConfig {
 	if kc, ok := m.byHash[hash]; ok {
 		return kc
 	}
-	kc := &KeyConfig{ID: randID(), Key: key, Name: name, AllowAll: true, Hash: hash}
+	kc := &KeyConfig{ID: randID(), Key: key, Name: "", AllowAll: true, Hash: hash}
 	m.keys = append(m.keys, kc)
 	m.byHash[hash] = kc
 	return kc
 }
 
-func (m *Manager) AddKey(key, name, listenAddr, targetAddr, protocol string) (*KeyConfig, error) {
+func (m *Manager) AddKey(key, listenAddr, targetAddr, protocol string) (*KeyConfig, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -274,7 +274,7 @@ func (m *Manager) AddKey(key, name, listenAddr, targetAddr, protocol string) (*K
 	listenAddr = normalizeListenAddr(listenAddr)
 	targetAddr = normalizeTargetAddr(targetAddr)
 	protocol = normalizeProtocol(protocol)
-	kc := &KeyConfig{ID: randID(), Key: key, Name: name, Hash: hash}
+	kc := &KeyConfig{ID: randID(), Key: key, Name: "", Hash: hash}
 	if listenAddr != "" && targetAddr != "" {
 		kc.Rules = []*ForwardRule{{ID: randID(), ListenAddr: listenAddr, TargetAddr: targetAddr, Protocol: protocol}}
 	}

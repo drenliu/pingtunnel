@@ -17,16 +17,20 @@ type Server struct {
 	manager  *Manager
 	icmpConn *icmp.PacketConn
 
-	clientAddr net.Addr
-	clientMu   sync.RWMutex
+	// Per-tunnel-key outbound queue: ICMP replies must carry payloads for the same key
+	// as the requesting client, so multiple clients with different keys do not cross-talk.
+	sendQueues   map[[16]byte]chan *TunnelPacket
+	sendQueuesMu sync.Mutex
+
+	// Last ICMP source address per authenticated key (for status UI).
+	icmpPeers   map[[16]byte]net.Addr
+	icmpPeersMu sync.RWMutex
 
 	listenersTCP map[string]net.Listener
 	listenersUDP map[string]*net.UDPConn
 	udpSessions  map[string]*ServerConn // key: listenAddr|remoteUDP
 	connections  map[uint32]*ServerConn
 	nextConnID   uint32
-
-	sendQueue chan *TunnelPacket
 
 	mu     sync.RWMutex
 	closed int32
@@ -66,11 +70,12 @@ type ServerConn struct {
 func NewServer(mgr *Manager) *Server {
 	return &Server{
 		manager:      mgr,
+		sendQueues:   make(map[[16]byte]chan *TunnelPacket),
+		icmpPeers:    make(map[[16]byte]net.Addr),
 		listenersTCP: make(map[string]net.Listener),
 		listenersUDP: make(map[string]*net.UDPConn),
 		udpSessions:  make(map[string]*ServerConn),
 		connections:  make(map[uint32]*ServerConn),
-		sendQueue:    make(chan *TunnelPacket, 4096),
 		done:         make(chan struct{}),
 	}
 }
@@ -101,6 +106,16 @@ func (s *Server) Close() {
 		}
 	}
 	s.mu.Unlock()
+
+	s.sendQueuesMu.Lock()
+	for _, ch := range s.sendQueues {
+		close(ch)
+	}
+	s.sendQueues = make(map[[16]byte]chan *TunnelPacket)
+	s.sendQueuesMu.Unlock()
+	s.icmpPeersMu.Lock()
+	s.icmpPeers = make(map[[16]byte]net.Addr)
+	s.icmpPeersMu.Unlock()
 }
 
 func (s *Server) Run() error {
@@ -154,22 +169,14 @@ func (s *Server) Run() error {
 
 		atomic.AddUint64(&s.stats.icmpIn, 1)
 
-		s.clientMu.Lock()
-		s.clientAddr = addr
-		s.clientMu.Unlock()
-
 		clientKeyHash := pkt.KeyHash
+		s.icmpPeersMu.Lock()
+		s.icmpPeers[clientKeyHash] = addr
+		s.icmpPeersMu.Unlock()
+
 		s.handlePacket(pkt)
 
-		var resp *TunnelPacket
-		select {
-		case resp = <-s.sendQueue:
-			if len(s.sendQueue) > 0 {
-				resp.Flags |= FlagMore
-			}
-		default:
-			resp = &TunnelPacket{Cmd: CmdPing}
-		}
+		resp := s.dequeueForKey(clientKeyHash)
 		resp.Magic = MagicResponse
 		resp.KeyHash = clientKeyHash
 
@@ -226,7 +233,11 @@ func (s *Server) handleSetup(pkt *TunnelPacket) {
 		kc := s.manager.ValidateKey(pkt.KeyHash)
 		keyInfo := "unknown"
 		if kc != nil {
-			keyInfo = kc.Name + " (key=" + kc.Key + ")"
+			if kc.Name != "" {
+				keyInfo = kc.Name + " (key=" + kc.Key + ")"
+			} else {
+				keyInfo = "key=" + kc.Key
+			}
 		}
 		log.Printf("[server] setup rejected: %s -> %s (%s) key=%s (not allowed)", listenAddr, targetAddr, protocol, keyInfo)
 		return
@@ -249,7 +260,7 @@ func (s *Server) handleSetup(pkt *TunnelPacket) {
 			go s.startTCPListener(listenAddr, targetAddr, pkt.KeyHash)
 		}
 	}
-	s.enqueue(&TunnelPacket{Cmd: CmdSetupAck})
+	s.enqueueKey(pkt.KeyHash, &TunnelPacket{Cmd: CmdSetupAck})
 	log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s", listenAddr, targetAddr, protocol)
 }
 
@@ -375,10 +386,11 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 			keyHash:    keyHash,
 			ready:      make(chan struct{}),
 		}
-		sc.reliSend = NewReliableSend(connID, s.enqueue)
+		enk := s.makeEnqueueKey(keyHash)
+		sc.reliSend = NewReliableSend(connID, enk)
 		sc.reliRecv = NewReliableRecv(connID,
 			func(data []byte) error { _, err := sc.tcpConn.Write(data); return err },
-			s.enqueue,
+			enk,
 		)
 
 		s.mu.Lock()
@@ -386,7 +398,7 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 		s.mu.Unlock()
 
 		log.Printf("[server] conn %d from %s", connID, tc.RemoteAddr())
-		s.enqueue(&TunnelPacket{
+		s.enqueueKey(keyHash, &TunnelPacket{
 			Cmd:    CmdConnect,
 			ConnID: connID,
 			Data:   []byte(targetAddr),
@@ -471,7 +483,8 @@ func (s *Server) udpReadLoop(uc *net.UDPConn, listenAddr, targetAddr string, key
 			keyHash:    keyHash,
 			ready:      make(chan struct{}),
 		}
-		sc.reliSend = NewReliableSend(connID, s.enqueue)
+		enk := s.makeEnqueueKey(keyHash)
+		sc.reliSend = NewReliableSend(connID, enk)
 		sc.reliRecv = NewReliableRecv(connID,
 			func(data []byte) error {
 				_, werr := sc.udpSock.WriteTo(data, sc.udpRemote)
@@ -480,14 +493,14 @@ func (s *Server) udpReadLoop(uc *net.UDPConn, listenAddr, targetAddr string, key
 				}
 				return werr
 			},
-			s.enqueue,
+			enk,
 		)
 		s.udpSessions[sessKey] = sc
 		s.connections[connID] = sc
 		s.mu.Unlock()
 
 		log.Printf("[server] UDP conn %d from %s", connID, ra.String())
-		s.enqueue(&TunnelPacket{
+		s.enqueueKey(keyHash, &TunnelPacket{
 			Cmd:    CmdConnect,
 			ConnID: connID,
 			Data:   []byte(targetAddr),
@@ -516,7 +529,7 @@ func (s *Server) waitReady(sc *ServerConn) {
 			go s.readTCP(sc)
 			return
 		case <-retry.C:
-			s.enqueue(&TunnelPacket{
+			s.enqueueKey(sc.keyHash, &TunnelPacket{
 				Cmd:    CmdConnect,
 				ConnID: sc.id,
 				Data:   []byte(sc.targetAddr),
@@ -569,7 +582,7 @@ func (s *Server) closeConn(sc *ServerConn) {
 	}
 	s.mu.Unlock()
 
-	s.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: sc.id})
+	s.enqueueKey(sc.keyHash, &TunnelPacket{Cmd: CmdClose, ConnID: sc.id})
 	log.Printf("[server] conn %d closed", sc.id)
 }
 
@@ -639,11 +652,45 @@ func (s *Server) statsLoop() {
 	}
 }
 
-func (s *Server) enqueue(pkt *TunnelPacket) {
+func (s *Server) makeEnqueueKey(keyHash [16]byte) func(*TunnelPacket) {
+	return func(p *TunnelPacket) {
+		s.enqueueKey(keyHash, p)
+	}
+}
+
+func (s *Server) enqueueKey(keyHash [16]byte, pkt *TunnelPacket) {
+	if atomic.LoadInt32(&s.closed) != 0 {
+		return
+	}
+	s.sendQueuesMu.Lock()
+	ch := s.sendQueues[keyHash]
+	if ch == nil {
+		ch = make(chan *TunnelPacket, 4096)
+		s.sendQueues[keyHash] = ch
+	}
+	s.sendQueuesMu.Unlock()
 	select {
-	case s.sendQueue <- pkt:
+	case ch <- pkt:
 	default:
-		log.Println("[server] send queue full, dropping")
+		log.Println("[server] send queue full for key, dropping")
+	}
+}
+
+func (s *Server) dequeueForKey(keyHash [16]byte) *TunnelPacket {
+	s.sendQueuesMu.Lock()
+	ch := s.sendQueues[keyHash]
+	s.sendQueuesMu.Unlock()
+	if ch == nil {
+		return &TunnelPacket{Cmd: CmdPing}
+	}
+	select {
+	case resp := <-ch:
+		if len(ch) > 0 {
+			resp.Flags |= FlagMore
+		}
+		return resp
+	default:
+		return &TunnelPacket{Cmd: CmdPing}
 	}
 }
 
