@@ -83,7 +83,7 @@ Open `http://120.120.120.120:8080`, log in, and add a rule:
 **2. Client (internal network machine)**
 
 ```bash
-sudo ./pingtunnel -type client -l :4455 -s 120.46.204.235 -t 192.168.33.1:22 -key office-ssh
+sudo ./pingtunnel -type client -l :4455 -s 120.120.120.120 -t 192.168.33.1:22 -key office-ssh
 ```
 
 **3. Connect**
