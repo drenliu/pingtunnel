@@ -12,14 +12,18 @@ const (
 	MagicRequest  uint32 = 0x50545251
 	MagicResponse uint32 = 0x50545250
 
-	CmdSetup      uint8 = 1
-	CmdSetupAck   uint8 = 2
-	CmdConnect    uint8 = 3
-	CmdConnectAck uint8 = 4
-	CmdData       uint8 = 5
-	CmdClose      uint8 = 6
-	CmdPing       uint8 = 7
-	CmdDataAck    uint8 = 8
+	CmdSetup             uint8 = 1
+	CmdSetupAck          uint8 = 2
+	CmdConnect           uint8 = 3
+	CmdConnectAck        uint8 = 4
+	CmdData              uint8 = 5
+	CmdClose             uint8 = 6
+	CmdPing              uint8 = 7
+	CmdDataAck           uint8 = 8
+	CmdSocksDial         uint8 = 9  // client -> server: dynamic forward dial host:port in Data
+	CmdSocksDialAck      uint8 = 10 // server -> client: dial succeeded
+	CmdSocksRegister     uint8 = 11 // client -> server: register SOCKS-only tunnel (no -l/-t)
+	CmdSocksRegisterNack uint8 = 12 // server -> client: SOCKS dynamic disabled on server
 
 	FlagMore uint8 = 0x01
 

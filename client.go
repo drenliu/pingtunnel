@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,7 @@ type Client struct {
 	serverAddr string
 	targetAddr string
 	protocol   string
+	socksAddr  string
 	key        [16]byte
 
 	icmpConn *icmp.PacketConn
@@ -26,11 +28,18 @@ type Client struct {
 	pending     map[uint32]bool
 	sendQueue   chan *TunnelPacket
 
+	socksListener net.Listener
+	socksLnMu     sync.Mutex
+	socksWait     map[uint32]chan bool
+	socksMu       sync.Mutex
+	nextSocksConn uint32
+
 	icmpSeq   uint32
 	mu        sync.RWMutex
 	closed    int32
 	done      chan struct{}
 	setupDone chan struct{}
+	setupFail chan struct{}
 }
 
 type ClientConn struct {
@@ -44,18 +53,21 @@ type ClientConn struct {
 	idleTimer *time.Timer
 }
 
-func NewClient(listenAddr, serverAddr, targetAddr, key, protocol string) *Client {
+func NewClient(listenAddr, serverAddr, targetAddr, key, protocol, socksAddr string) *Client {
 	return &Client{
 		listenAddr:  listenAddr,
 		serverAddr:  serverAddr,
 		targetAddr:  targetAddr,
 		protocol:    normalizeProtocol(protocol),
+		socksAddr:   strings.TrimSpace(socksAddr),
 		key:         ComputeKeyHash(key),
 		connections: make(map[uint32]*ClientConn),
 		pending:     make(map[uint32]bool),
+		socksWait:   make(map[uint32]chan bool),
 		sendQueue:   make(chan *TunnelPacket, 4096),
 		done:        make(chan struct{}),
 		setupDone:   make(chan struct{}),
+		setupFail:   make(chan struct{}),
 	}
 }
 
@@ -64,6 +76,11 @@ func (c *Client) Close() {
 		return
 	}
 	close(c.done)
+	c.socksLnMu.Lock()
+	if c.socksListener != nil {
+		c.socksListener.Close()
+	}
+	c.socksLnMu.Unlock()
 	if c.icmpConn != nil {
 		c.icmpConn.Close()
 	}
@@ -97,15 +114,29 @@ func (c *Client) Run() error {
 
 	go c.receiver()
 	go c.sender()
-	go c.sendSetup()
+	if c.wantPortForward() {
+		go c.sendSetup()
+	}
+	if c.socksAddr != "" && !c.wantPortForward() {
+		go c.sendSocksRegister()
+	}
 	go c.retransmitLoop()
 
 	log.Printf("[client] connecting to server %s ...", c.serverAddr)
 
 	select {
 	case <-c.setupDone:
-		log.Printf("[client] tunnel ready: %s listens on %s, target %s (%s)",
-			c.serverAddr, c.listenAddr, c.targetAddr, c.protocol)
+		if c.wantPortForward() {
+			log.Printf("[client] tunnel ready: %s listens on %s, target %s (%s)",
+				c.serverAddr, c.listenAddr, c.targetAddr, c.protocol)
+		} else if c.socksAddr != "" {
+			log.Printf("[client] tunnel ready: %s (SOCKS dynamic)", c.serverAddr)
+		}
+		if c.socksAddr != "" {
+			go c.startSOCKS5(c.socksAddr)
+		}
+	case <-c.setupFail:
+		return fmt.Errorf("server rejected SOCKS registration (start server with -socks-dynamic)")
 	case <-time.After(30 * time.Second):
 		return fmt.Errorf("setup timeout (check -key and server status)")
 	case <-c.done:
@@ -116,7 +147,14 @@ func (c *Client) Run() error {
 	return nil
 }
 
+func (c *Client) wantPortForward() bool {
+	return strings.TrimSpace(c.listenAddr) != "" && strings.TrimSpace(c.targetAddr) != ""
+}
+
 func (c *Client) sendSetup() {
+	if !c.wantPortForward() {
+		return
+	}
 	data := fmt.Sprintf("%s|%s|%s", c.listenAddr, c.targetAddr, c.protocol)
 	for i := 0; i < 30; i++ {
 		select {
@@ -127,6 +165,20 @@ func (c *Client) sendSetup() {
 		default:
 		}
 		c.enqueue(&TunnelPacket{Cmd: CmdSetup, Data: []byte(data)})
+		time.Sleep(time.Second)
+	}
+}
+
+func (c *Client) sendSocksRegister() {
+	for i := 0; i < 30; i++ {
+		select {
+		case <-c.setupDone:
+			return
+		case <-c.done:
+			return
+		default:
+		}
+		c.enqueue(&TunnelPacket{Cmd: CmdSocksRegister})
 		time.Sleep(time.Second)
 	}
 }
@@ -232,6 +284,27 @@ func (c *Client) handlePacket(pkt *TunnelPacket) {
 		c.handleDataAck(pkt)
 	case CmdClose:
 		c.handleCloseCmd(pkt)
+	case CmdSocksDialAck:
+		c.handleSocksDialAck(pkt)
+	case CmdSocksRegisterNack:
+		select {
+		case <-c.setupFail:
+		default:
+			close(c.setupFail)
+		}
+	}
+}
+
+func (c *Client) handleSocksDialAck(pkt *TunnelPacket) {
+	c.socksMu.Lock()
+	ch := c.socksWait[pkt.ConnID]
+	delete(c.socksWait, pkt.ConnID)
+	c.socksMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- true:
+		default:
+		}
 	}
 }
 
@@ -360,6 +433,18 @@ func (c *Client) handleDataAck(pkt *TunnelPacket) {
 }
 
 func (c *Client) handleCloseCmd(pkt *TunnelPacket) {
+	c.socksMu.Lock()
+	if ch, wk := c.socksWait[pkt.ConnID]; wk {
+		delete(c.socksWait, pkt.ConnID)
+		c.socksMu.Unlock()
+		select {
+		case ch <- false:
+		default:
+		}
+	} else {
+		c.socksMu.Unlock()
+	}
+
 	c.mu.Lock()
 	cc, ok := c.connections[pkt.ConnID]
 	if ok {

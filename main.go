@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 )
 
@@ -17,6 +18,8 @@ func main() {
 	target := flag.String("t", "", "target address, e.g. 192.168.33.1:22")
 	protocol := flag.String("protocol", "tcp", "forwarding protocol: tcp or udp (client only)")
 	webAddr := flag.String("web", ":8080", "web management listen address")
+	socksDynamic := flag.Bool("socks-dynamic", false, "server: allow client SOCKS5 dynamic forwarding (-socks)")
+	socks := flag.String("socks", "", "client: local SOCKS5 listen address, e.g. :1080")
 
 	flag.Parse()
 
@@ -24,12 +27,13 @@ func main() {
 		fmt.Println("pingtunnel - TCP/UDP port forwarding over ICMP")
 		fmt.Println()
 		fmt.Println("Usage:")
-		fmt.Println("  Server:  pingtunnel -type server -key <admin_password> [-web :8080]")
-		fmt.Println("  Client:  pingtunnel -type client -l :4455 -s <server_ip> -t <target> -key <tunnel_key> [-protocol tcp|udp]")
+		fmt.Println("  Server:  pingtunnel -type server -key <admin_password> [-web :8080] [-socks-dynamic]")
+		fmt.Println("  Client:  pingtunnel -type client -s <server_ip> -key <tunnel_key> (-l :port -t <target> | -socks :1080) [-protocol tcp|udp]")
 		fmt.Println()
 		fmt.Println("Server options:")
 		fmt.Println("  -key    Web admin password (username: admin)")
 		fmt.Println("  -web    Web management listen address (default :8080)")
+		fmt.Println("  -socks-dynamic  Allow SOCKS5 dynamic port forwarding for clients using -socks")
 		fmt.Println()
 		fmt.Println("Client options:")
 		fmt.Println("  -l      Local listen address")
@@ -37,6 +41,7 @@ func main() {
 		fmt.Println("  -t      Target address to forward to")
 		fmt.Println("  -key    Tunnel authentication key (configured on server via web)")
 		fmt.Println("  -protocol  tcp (default) or udp; must match the server rule")
+		fmt.Println("  -socks    Local SOCKS5 listen (ssh -D style); requires server -socks-dynamic")
 		fmt.Println()
 		fmt.Println("Examples:")
 		fmt.Println("  sudo pingtunnel -type server -key 123456")
@@ -63,7 +68,7 @@ func main() {
 			log.Printf("[main] config load: %v (starting fresh)", err)
 		}
 
-		srv := NewServer(mgr)
+		srv := NewServer(mgr, *socksDynamic)
 		StartWeb(*webAddr, *key, mgr, srv)
 
 		go func() {
@@ -77,10 +82,23 @@ func main() {
 		}
 
 	case "client":
-		if *server == "" || *target == "" || *listen == "" {
-			log.Fatal("client mode requires -l, -s, and -t flags")
+		listenTrim := strings.TrimSpace(*listen)
+		targetTrim := strings.TrimSpace(*target)
+		socksTrim := strings.TrimSpace(*socks)
+		hasPF := listenTrim != "" && targetTrim != ""
+		if *server == "" {
+			log.Fatal("client mode requires -s")
 		}
-		cli := NewClient(*listen, *server, *target, *key, *protocol)
+		if *key == "" {
+			log.Fatal("client mode requires -key")
+		}
+		if (listenTrim != "") != (targetTrim != "") {
+			log.Fatal("client -l and -t must both be set for port forwarding, or omit both when using -socks only")
+		}
+		if !hasPF && socksTrim == "" {
+			log.Fatal("client mode requires (-l and -t) and/or -socks")
+		}
+		cli := NewClient(listenTrim, *server, targetTrim, *key, *protocol, socksTrim)
 		go func() {
 			<-sigCh
 			log.Println("shutting down ...")

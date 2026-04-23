@@ -22,6 +22,9 @@ type Server struct {
 	manager  *Manager
 	icmpConn *icmp.PacketConn
 
+	// socksDynamic: when true, accept CmdSocksDial / CmdSocksRegister from clients.
+	socksDynamic bool
+
 	// Per-tunnel-key outbound queue: ICMP replies must carry payloads for the same key
 	// as the requesting client, so multiple clients with different keys do not cross-talk.
 	sendQueues   map[[16]byte]chan *TunnelPacket
@@ -77,9 +80,10 @@ type ruleTunnelState struct {
 	lastSeen time.Time
 }
 
-func NewServer(mgr *Manager) *Server {
+func NewServer(mgr *Manager, socksDynamic bool) *Server {
 	return &Server{
 		manager:           mgr,
+		socksDynamic:      socksDynamic,
 		sendQueues:        make(map[[16]byte]chan *TunnelPacket),
 		ruleTunnelClients: make(map[string]*ruleTunnelState),
 		listenersTCP:      make(map[string]net.Listener),
@@ -220,6 +224,10 @@ func (s *Server) handlePacket(pkt *TunnelPacket, from net.Addr) {
 		s.handleDataAck(pkt)
 	case CmdClose:
 		s.handleClose(pkt)
+	case CmdSocksDial:
+		s.handleSocksDial(pkt)
+	case CmdSocksRegister:
+		s.handleSocksRegister(pkt, from)
 	}
 }
 
@@ -327,6 +335,74 @@ func (s *Server) handleClose(pkt *TunnelPacket) {
 		}
 		log.Printf("[server] conn %d closed by client", pkt.ConnID)
 	}
+}
+
+func (s *Server) handleSocksRegister(pkt *TunnelPacket, from net.Addr) {
+	if !s.socksDynamic {
+		log.Printf("[server] SOCKS register rejected (socks-dynamic disabled)")
+		s.enqueueKey(pkt.KeyHash, &TunnelPacket{Cmd: CmdSocksRegisterNack})
+		return
+	}
+	s.enqueueKey(pkt.KeyHash, &TunnelPacket{Cmd: CmdSetupAck})
+	s.registerRuleTunnelClient(pkt.KeyHash, "socks-dynamic", from)
+	log.Printf("[server] SOCKS dynamic forwarding registered for tunnel key")
+}
+
+func (s *Server) handleSocksDial(pkt *TunnelPacket) {
+	if !s.socksDynamic {
+		log.Printf("[server] SOCKS dial conn %d rejected (socks-dynamic disabled)", pkt.ConnID)
+		s.enqueueKey(pkt.KeyHash, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		return
+	}
+	if pkt.ConnID == 0 || len(pkt.Data) == 0 {
+		return
+	}
+	target := normalizeSocksDialTarget(string(pkt.Data))
+	if target == "" {
+		s.enqueueKey(pkt.KeyHash, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		return
+	}
+
+	s.mu.Lock()
+	if _, exists := s.connections[pkt.ConnID]; exists {
+		s.mu.Unlock()
+		s.enqueueKey(pkt.KeyHash, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		return
+	}
+	s.mu.Unlock()
+
+	conn, err := net.DialTimeout("tcp", target, 15*time.Second)
+	if err != nil {
+		log.Printf("[server] SOCKS dial %d %s: %v", pkt.ConnID, target, err)
+		s.enqueueKey(pkt.KeyHash, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		return
+	}
+
+	connID := pkt.ConnID
+	sc := &ServerConn{
+		id:         connID,
+		proto:      "tcp",
+		tcpConn:    conn,
+		targetAddr: target,
+		keyHash:    pkt.KeyHash,
+		ready:      make(chan struct{}),
+	}
+	enk := s.makeEnqueueKey(pkt.KeyHash)
+	sc.reliSend = NewReliableSend(connID, enk)
+	sc.reliRecv = NewReliableRecv(connID,
+		func(data []byte) error { _, e := conn.Write(data); return e },
+		enk,
+	)
+
+	s.mu.Lock()
+	s.connections[connID] = sc
+	s.mu.Unlock()
+
+	sc.readyOnce.Do(func() { close(sc.ready) })
+	s.enqueueKey(pkt.KeyHash, &TunnelPacket{Cmd: CmdSocksDialAck, ConnID: connID})
+	log.Printf("[server] SOCKS conn %d -> %s", connID, target)
+
+	go s.readTCP(sc)
 }
 
 // --------------- auto-start ---------------
