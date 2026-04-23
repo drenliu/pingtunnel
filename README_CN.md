@@ -14,6 +14,7 @@
 - **连接监控** — 实时显示活跃 TCP/UDP 会话及其客户端地址
 - **配置持久化** — 密钥、规则、流量数据自动保存到 `pingtunnel.json`
 - **自动恢复** — 服务器重启后自动根据配置文件恢复端口监听
+- **SOCKS5 动态转发** — 可选本地 SOCKS5 代理（类似 `ssh -D`）；服务端通过 `-socks-dynamic` 控制是否允许
 
 ## 编译
 
@@ -43,6 +44,7 @@ sudo ./pingtunnel -type server -key <管理密码>
 |------|------|--------|
 | `-key` | Web 管理登录密码（用户名固定为 `admin`） | 必填 |
 | `-web` | Web 管理监听地址 | `:8080` |
+| `-socks-dynamic` | 允许客户端使用 `-socks`（经隧道的 SOCKS5 动态转发） | 关闭 |
 
 启动后打开浏览器访问 `http://<服务器IP>:8080`，使用 `admin` / `<管理密码>` 登录。
 
@@ -55,19 +57,31 @@ sudo ./pingtunnel -type server -key <管理密码>
 
 ### 客户端
 
+至少需要 **固定端口转发（`-l` 与 `-t` 同时指定）** 或 **SOCKS 动态转发（`-socks`）** 其一；`-s` 与 `-key` 始终必填。`-l` 与 `-t` 必须成对出现或同时省略。
+
 ```bash
+# 仅固定转发
 sudo ./pingtunnel -type client -l <监听地址> -s <服务器IP> -t <目标地址> -key <隧道密钥> [-protocol tcp|udp]
+
+# 仅 SOCKS 动态转发（服务端须加 -socks-dynamic）
+sudo ./pingtunnel -type client -s <服务器IP> -key <隧道密钥> -socks <socks监听地址>
+
+# 固定转发与 SOCKS 共用一条隧道
+sudo ./pingtunnel -type client -l <监听地址> -s <服务器IP> -t <目标地址> -key <隧道密钥> -socks :1080
 ```
 
 参数说明：
 
 | 参数 | 说明 |
 |------|------|
-| `-l` | 本地监听地址（与服务器端规则中的 Listen Address 一致） |
+| `-l` | 本地监听地址（与服务器端规则中的 Listen Address 一致）；做固定转发时须与 `-t` 同时使用 |
 | `-s` | 服务器 ICMP 地址（服务器公网 IP） |
-| `-t` | 转发目标地址（与服务器端规则中的 Target Address 一致） |
+| `-t` | 转发目标地址（与服务器端规则中的 Target Address 一致）；做固定转发时须与 `-l` 同时使用 |
 | `-key` | 隧道认证密钥（在服务器 Web 界面中配置的 Key） |
 | `-protocol` | `tcp`（默认）或 `udp`，须与服务器端该条规则的协议一致 |
+| `-socks` | 本地 SOCKS5 监听地址（如 `:1080`），行为类似 `ssh -D`。无认证，仅支持 CONNECT。服务端必须带 `-socks-dynamic` 才会允许。 |
+
+若服务端未开启 `-socks-dynamic`，纯 `-socks` 模式会立即报错；若同时配置了 `-l`/`-t`，固定转发仍可用，但 SOCKS 拨号会失败，直至服务端开启该选项。
 
 ## 示例
 
@@ -99,6 +113,26 @@ ssh user@120.120.120.120 -p 4455
 ```
 
 流量路径：`SSH 客户端 → 服务器:4455 → ICMP 隧道 → 内网客户端 → 192.168.33.1:22`
+
+### 场景：SOCKS5 动态转发（类似 `ssh -D`）
+
+**1. 服务器端**
+
+```bash
+sudo ./pingtunnel -type server -key admin123 -socks-dynamic
+```
+
+**2. 客户端（本机起 SOCKS5；出站 TCP 由服务器代拨）**
+
+```bash
+sudo ./pingtunnel -type client -s 120.120.120.120 -key office-ssh -socks :1080
+```
+
+**3. 使用支持 SOCKS5 的工具**
+
+```bash
+curl --socks5 127.0.0.1:1080 https://example.com
+```
 
 ## 项目结构
 

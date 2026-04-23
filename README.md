@@ -14,6 +14,7 @@ TCP and UDP port forwarding over the ICMP (Ping) protocol. Encapsulates TCP or U
 - **Connection Monitoring** — Live view of active TCP connections with client IPs
 - **Persistent Config** — Keys, rules, and traffic data saved to `pingtunnel.json`
 - **Auto Recovery** — Server automatically restores port listeners from config on restart
+- **SOCKS5 Dynamic Forwarding** — Optional local SOCKS5 proxy (`ssh -D` style); server can enable or disable it with `-socks-dynamic`
 
 ## Build
 
@@ -41,6 +42,7 @@ sudo ./pingtunnel -type server -key <admin_password>
 |------|-------------|---------|
 | `-key` | Web admin login password (username is `admin`) | Required |
 | `-web` | Web management listen address | `:8080` |
+| `-socks-dynamic` | Allow clients to use `-socks` (SOCKS5 dynamic forwarding over the tunnel) | off |
 
 After starting, open `http://<server_ip>:8080` in your browser and log in with `admin` / `<admin_password>`.
 
@@ -53,17 +55,29 @@ Use the Web UI to add tunnel keys and forwarding rules:
 
 ### Client
 
+You need **either** fixed port forwarding **(`-l` and `-t` together)** **or** SOCKS dynamic forwarding **(`-socks`)**, or **both**. `-s` and `-key` are always required.
+
 ```bash
+# Fixed forwarding only
 sudo ./pingtunnel -type client -l <listen_addr> -s <server_ip> -t <target_addr> -key <tunnel_key> [-protocol tcp|udp]
+
+# SOCKS dynamic forwarding only (server must use -socks-dynamic)
+sudo ./pingtunnel -type client -s <server_ip> -key <tunnel_key> -socks <socks_listen_addr>
+
+# Both fixed forwarding and SOCKS on the same tunnel
+sudo ./pingtunnel -type client -l <listen_addr> -s <server_ip> -t <target_addr> -key <tunnel_key> -socks :1080
 ```
 
 | Flag | Description |
 |------|-------------|
-| `-l` | Local listen address (matches the server rule's Listen Address) |
+| `-l` | Local listen address (matches the server rule's Listen Address); must be used together with `-t` when doing fixed forwarding |
 | `-s` | Server ICMP address (server's public IP) |
-| `-t` | Forward target address (matches the server rule's Target Address) |
+| `-t` | Forward target address (matches the server rule's Target Address); must be used together with `-l` when doing fixed forwarding |
 | `-key` | Tunnel authentication key (configured on the server via Web UI) |
 | `-protocol` | `tcp` (default) or `udp`; must match the rule’s protocol on the server |
+| `-socks` | Local SOCKS5 listen address (e.g. `:1080`), similar to `ssh -D`. No authentication; CONNECT only. Requires the server to be started with `-socks-dynamic`. |
+
+If the server does not enable `-socks-dynamic`, SOCKS-only clients receive an immediate error; combined-mode clients can still use fixed forwarding, but SOCKS dials will fail until the server enables it.
 
 ## Example
 
@@ -95,6 +109,26 @@ ssh user@120.46.204.235 -p 4455
 ```
 
 Traffic path: `SSH Client → Server:4455 → ICMP Tunnel → Internal Client → 192.168.33.1:22`
+
+### Scenario: SOCKS5 dynamic forwarding (like `ssh -D`)
+
+**1. Server**
+
+```bash
+sudo ./pingtunnel -type server -key admin123 -socks-dynamic
+```
+
+**2. Client (runs a local SOCKS5 proxy; outbound TCP is dialed by the server)**
+
+```bash
+sudo ./pingtunnel -type client -s 120.120.120.120 -key office-ssh -socks :1080
+```
+
+**3. Use any SOCKS5-aware tool**
+
+```bash
+curl --socks5 127.0.0.1:1080 https://example.com
+```
 
 ## Project Structure
 
