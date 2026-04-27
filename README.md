@@ -1,12 +1,13 @@
 # PingTunnel
 
-TCP and UDP port forwarding over the ICMP (Ping) protocol. Encapsulates TCP or UDP traffic inside ICMP Echo Request/Reply packets, enabling network access through firewalls that only allow Ping.
+TCP and UDP port forwarding over the **ICMP (Ping) protocol** or, alternatively, over **DNS** (UDP queries/responses with EDNS0, same tunnel framing as ICMP). ICMP mode targets environments that only allow ping; DNS mode is useful when only DNS-like UDP traffic to your server is allowed, and it usually does not require `root` (unless you bind a privileged port such as 53).
 
 [中文文档](README_CN.md)
 
 ## Features
 
 - **ICMP Tunneling** — TCP or UDP traffic wrapped in Ping packets, bypassing typical firewall restrictions on direct traffic
+- **DNS Tunneling (optional)** — Same protocol over DNS-like UDP/EDNS0. The **server** can run **ICMP and DNS at the same time** (default `-transport both`). The **client** still picks **one** carrier: `-transport icmp` or `-transport dns`.
 - **Reliable Transport** — Sequence numbers, ACKs, automatic retransmission, and out-of-order buffering for lossy networks
 - **Web Management** — Built-in Web UI for managing tunnel keys and port forwarding rules
 - **Authentication** — Web UI secured with admin login and session-based auth
@@ -30,18 +31,36 @@ GOOS=linux GOARCH=amd64 go build -o pingtunnel .
 
 ## Usage
 
-> **Note:** Requires root privileges for raw ICMP sockets.
+> **Note:** The default **ICMP** mode requires `root` for raw ICMP sockets. **DNS** mode uses a normal UDP datagram socket and does not (unless you bind a privileged port such as 53).
 
 ### Server
 
+**ICMP (default):**
+
 ```bash
 sudo ./pingtunnel -type server -key <admin_password>
+```
+
+**ICMP + DNS (default, server listens on both; clients choose either to connect):**
+
+```bash
+./pingtunnel -type server -key <admin_password>
+# same: -transport both
+```
+
+**DNS only** (e.g. no root on the host):
+
+```bash
+./pingtunnel -type server -key <admin_password> -transport dns -dns-addr :1053 -dns-name c.pingt.local
 ```
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-key` | Web admin login password (username is `admin`) | Required |
 | `-web` | Web management listen address | `:8080` |
+| `-transport` | `both` (default): ICMP and DNS. Or `icmp` or `dns` only | `both` |
+| `-dns-addr` | UDP port for the DNS part (when `both` or `dns`) | `:1053` |
+| `-dns-name` | QNAME for DNS; must match **DNS** clients’ `-dns-name` | `c.pingt.local` |
 | `-socks-dynamic` | Allow clients to use `-socks` (SOCKS5 dynamic forwarding over the tunnel) | off |
 
 After starting, open `http://<server_ip>:8080` in your browser and log in with `admin` / `<admin_password>`.
@@ -76,6 +95,10 @@ sudo ./pingtunnel -type client -l <listen_addr> -s <server_ip> -t <target_addr> 
 | `-key` | Tunnel authentication key (configured on the server via Web UI) |
 | `-protocol` | `tcp` (default) or `udp`; must match the rule’s protocol on the server |
 | `-socks` | Local SOCKS5 listen address (e.g. `:1080`), similar to `ssh -D`. No authentication; CONNECT only. Requires the server to be started with `-socks-dynamic`. |
+| `-transport` | `icmp` (default) or `dns` (client uses **one**; server can offer **both**). |
+| `-dns-name` | In DNS mode, the query name; must match the server (default `c.pingt.local`) |
+
+**Client vs server** — A server with default `-transport both` accepts both ICMP clients and DNS clients at the same time. **DNS mode / `-s` on the client** — use `host:port` to reach the server’s UDP listener (e.g. `120.120.120.120:1053`); the port defaults to `1053` if omitted. ICMP mode uses `-s` as the target host or IP (optional `:port` is stripped and ignored for the ICMP path).
 
 If the server does not enable `-socks-dynamic`, SOCKS-only clients receive an immediate error; combined-mode clients can still use fixed forwarding, but SOCKS dials will fail until the server enables it.
 
@@ -134,9 +157,10 @@ curl --socks5 127.0.0.1:1080 https://example.com
 
 ```
 ├── main.go          # CLI entry point and flag parsing
-├── protocol.go      # ICMP tunnel protocol definition and encoding
-├── server.go        # Server: ICMP listener, TCP/UDP forwarding
-├── client.go        # Client: ICMP tunnel connection, TCP/UDP forwarding
+├── protocol.go      # Tunnel frame definition and encoding
+├── dnstun.go        # DNS/UDP+EDNS0 carrier (optional transport)
+├── server.go        # Server: ICMP or DNS/UDP, TCP/UDP forwarding
+├── client.go        # Client: tunnel to server, TCP/UDP forwarding
 ├── reliable.go      # Reliable transport: seq numbers, ACK, retransmit, reordering
 ├── manager.go       # Key/rule management, traffic stats, config persistence
 ├── web.go           # Web HTTP server, API handlers, session auth

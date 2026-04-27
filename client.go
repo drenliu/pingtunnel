@@ -19,9 +19,13 @@ type Client struct {
 	targetAddr string
 	protocol   string
 	socksAddr  string
+	transport  string
+	dnsQName   string
 	key        [16]byte
 
-	icmpConn *icmp.PacketConn
+	// tunConn + tunPeer: ICMP echo or plain UDP to server (DNS transport)
+	tunConn  net.PacketConn
+	tunPeer  net.Addr
 	serverIP net.Addr
 
 	connections map[uint32]*ClientConn
@@ -34,7 +38,7 @@ type Client struct {
 	socksMu       sync.Mutex
 	nextSocksConn uint32
 
-	icmpSeq   uint32
+	tunSeq    uint32
 	mu        sync.RWMutex
 	closed    int32
 	done      chan struct{}
@@ -53,13 +57,15 @@ type ClientConn struct {
 	idleTimer *time.Timer
 }
 
-func NewClient(listenAddr, serverAddr, targetAddr, key, protocol, socksAddr string) *Client {
+func NewClient(listenAddr, serverAddr, targetAddr, key, protocol, socksAddr, transport, dnsName string) *Client {
 	return &Client{
 		listenAddr:  listenAddr,
 		serverAddr:  serverAddr,
 		targetAddr:  targetAddr,
 		protocol:    normalizeProtocol(protocol),
 		socksAddr:   strings.TrimSpace(socksAddr),
+		transport:   normalizeClientTransport(transport),
+		dnsQName:    strings.TrimSpace(dnsName),
 		key:         ComputeKeyHash(key),
 		connections: make(map[uint32]*ClientConn),
 		pending:     make(map[uint32]bool),
@@ -81,8 +87,8 @@ func (c *Client) Close() {
 		c.socksListener.Close()
 	}
 	c.socksLnMu.Unlock()
-	if c.icmpConn != nil {
-		c.icmpConn.Close()
+	if c.tunConn != nil {
+		c.tunConn.Close()
 	}
 	c.mu.Lock()
 	for _, cc := range c.connections {
@@ -95,22 +101,44 @@ func (c *Client) Close() {
 }
 
 func (c *Client) Run() error {
-	ip := net.ParseIP(c.serverAddr)
-	if ip == nil {
-		addrs, err := net.LookupHost(c.serverAddr)
+	if c.transport == "dns" {
+		peer, err := net.ResolveUDPAddr("udp", addUDPDefaultPort(c.serverAddr, defaultDNSPort))
 		if err != nil {
 			return fmt.Errorf("resolve %s: %w", c.serverAddr, err)
 		}
-		ip = net.ParseIP(addrs[0])
-	}
-	c.serverIP = &net.IPAddr{IP: ip}
+		if strings.TrimSpace(c.dnsQName) == "" {
+			c.dnsQName = defaultDNSQName
+		}
+		conn, err := net.ListenPacket("udp", "0.0.0.0:0")
+		if err != nil {
+			return fmt.Errorf("DNS transport UDP listen: %w", err)
+		}
+		c.tunConn = conn
+		c.tunPeer = peer
+		defer conn.Close()
+	} else {
+		host := c.serverAddr
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			addrs, err := net.LookupHost(host)
+			if err != nil {
+				return fmt.Errorf("resolve %s: %w", c.serverAddr, err)
+			}
+			ip = net.ParseIP(addrs[0])
+		}
+		c.serverIP = &net.IPAddr{IP: ip}
+		c.tunPeer = c.serverIP
 
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-	if err != nil {
-		return fmt.Errorf("ICMP listen failed (run as root): %w", err)
+		conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+		if err != nil {
+			return fmt.Errorf("ICMP listen failed (run as root): %w", err)
+		}
+		c.tunConn = conn
+		defer conn.Close()
 	}
-	c.icmpConn = conn
-	defer conn.Close()
 
 	go c.receiver()
 	go c.sender()
@@ -188,6 +216,10 @@ func (c *Client) sender() {
 	defer ticker.Stop()
 
 	icmpID := int(c.key[0])<<8 | int(c.key[1])
+	qn := c.dnsQName
+	if strings.TrimSpace(qn) == "" {
+		qn = defaultDNSQName
+	}
 
 	for atomic.LoadInt32(&c.closed) == 0 {
 		var pkt *TunnelPacket
@@ -211,7 +243,23 @@ func (c *Client) sender() {
 		if err != nil {
 			continue
 		}
-		seq := atomic.AddUint32(&c.icmpSeq, 1)
+		seq := atomic.AddUint32(&c.tunSeq, 1)
+		if c.transport == "dns" {
+			id := uint16(seq)
+			dnsWire, e := buildDNSRequest(id, qn, payload)
+			if e != nil {
+				log.Printf("[client] DNS request pack: %v", e)
+				continue
+			}
+			_, e = c.tunConn.WriteTo(dnsWire, c.tunPeer)
+			if e != nil {
+				if atomic.LoadInt32(&c.closed) != 0 {
+					return
+				}
+				log.Printf("[client] DNS write: %v", e)
+			}
+			continue
+		}
 		msg := &icmp.Message{
 			Type: ipv4.ICMPTypeEcho,
 			Code: 0,
@@ -225,15 +273,15 @@ func (c *Client) sender() {
 		if err != nil {
 			continue
 		}
-		c.icmpConn.WriteTo(mb, c.serverIP)
+		_, _ = c.tunConn.WriteTo(mb, c.tunPeer)
 	}
 }
 
 func (c *Client) receiver() {
 	buf := make([]byte, 65535)
 	for atomic.LoadInt32(&c.closed) == 0 {
-		c.icmpConn.SetReadDeadline(time.Now().Add(time.Second))
-		n, _, err := c.icmpConn.ReadFrom(buf)
+		c.tunConn.SetReadDeadline(time.Now().Add(time.Second))
+		n, _, err := c.tunConn.ReadFrom(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
@@ -243,7 +291,24 @@ func (c *Client) receiver() {
 			}
 			continue
 		}
-
+		if c.transport == "dns" {
+			if n < 12 {
+				continue
+			}
+			_, data, e := parseDNSResponse(buf[:n])
+			if e != nil {
+				continue
+			}
+			pkt, e := DecodeTunnelPacket(data)
+			if e != nil || pkt.Magic != MagicResponse || pkt.KeyHash != c.key {
+				continue
+			}
+			c.handlePacket(pkt)
+			if pkt.Flags&FlagMore != 0 {
+				c.enqueue(&TunnelPacket{Cmd: CmdPing})
+			}
+			continue
+		}
 		msg, err := icmp.ParseMessage(ProtocolICMP, buf[:n])
 		if err != nil || msg.Type != ipv4.ICMPTypeEchoReply {
 			continue
@@ -252,14 +317,11 @@ func (c *Client) receiver() {
 		if !ok {
 			continue
 		}
-
 		pkt, err := DecodeTunnelPacket(echo.Data)
 		if err != nil || pkt.Magic != MagicResponse || pkt.KeyHash != c.key {
 			continue
 		}
-
 		c.handlePacket(pkt)
-
 		if pkt.Flags&FlagMore != 0 {
 			c.enqueue(&TunnelPacket{Cmd: CmdPing})
 		}

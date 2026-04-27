@@ -146,8 +146,8 @@ func (ws *webServer) apiStatus(w http.ResponseWriter) {
 	s.mu.RUnlock()
 
 	json.NewEncoder(w).Encode(StatusInfo{
-		ICMPIn:      atomic.LoadUint64(&s.stats.icmpIn),
-		ICMPOut:     atomic.LoadUint64(&s.stats.icmpOut),
+		ICMPIn:      atomic.LoadUint64(&s.stats.tunIn),
+		ICMPOut:     atomic.LoadUint64(&s.stats.tunOut),
 		BadKey:      atomic.LoadUint64(&s.stats.badKey),
 		ActiveConns: conns,
 		Listeners:   listeners,

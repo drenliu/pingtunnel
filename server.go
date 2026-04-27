@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/miekg/dns"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 )
@@ -19,8 +20,14 @@ import (
 const icmpClientHeartbeatTTL = 45 * time.Second
 
 type Server struct {
-	manager  *Manager
-	icmpConn *icmp.PacketConn
+	manager *Manager
+	// At most one of these may be nil. Both may be set when the server uses ICMP+DNS.
+	tunICM    net.PacketConn
+	tunDNS    net.PacketConn
+	serveICMP bool
+	serveDNS  bool
+	dnsAddr   string
+	dnsQName  string
 
 	// socksDynamic: when true, accept CmdSocksDial / CmdSocksRegister from clients.
 	socksDynamic bool
@@ -45,8 +52,8 @@ type Server struct {
 	done   chan struct{}
 
 	stats struct {
-		icmpIn     uint64
-		icmpOut    uint64
+		tunIn      uint64
+		tunOut     uint64
 		badKey     uint64
 		retransmit uint64
 	}
@@ -80,10 +87,16 @@ type ruleTunnelState struct {
 	lastSeen time.Time
 }
 
-func NewServer(mgr *Manager, socksDynamic bool) *Server {
+func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName string) *Server {
+	si, sd := parseServerTransports(transport)
+	da, qn := finalizeDNSServerAddr(sd, dnsAddr, dnsQName)
 	return &Server{
 		manager:           mgr,
 		socksDynamic:      socksDynamic,
+		serveICMP:         si,
+		serveDNS:          sd,
+		dnsAddr:           da,
+		dnsQName:          qn,
 		sendQueues:        make(map[[16]byte]chan *TunnelPacket),
 		ruleTunnelClients: make(map[string]*ruleTunnelState),
 		listenersTCP:      make(map[string]net.Listener),
@@ -99,8 +112,11 @@ func (s *Server) Close() {
 		return
 	}
 	close(s.done)
-	if s.icmpConn != nil {
-		s.icmpConn.Close()
+	if s.tunICM != nil {
+		s.tunICM.Close()
+	}
+	if s.tunDNS != nil {
+		s.tunDNS.Close()
 	}
 	s.mu.Lock()
 	for _, l := range s.listenersTCP {
@@ -133,35 +149,91 @@ func (s *Server) Close() {
 }
 
 func (s *Server) Run() error {
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-	if err != nil {
-		return fmt.Errorf("ICMP listen failed (run as root): %w", err)
-	}
-	s.icmpConn = conn
-	defer conn.Close()
-
-	log.Println("[server] started, waiting for tunnel connections ...")
-
 	s.manager.StartTrafficLoop(s.done)
 	s.StartConfiguredListeners()
 	go s.retransmitLoop()
 	go s.statsLoop()
 
+	var (
+		ic  net.PacketConn
+		udp net.PacketConn
+	)
+	if s.serveICMP {
+		c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+		if err != nil {
+			if s.serveDNS {
+				log.Printf("[server] ICMP not available (need root?): %v — only DNS or none", err)
+			} else {
+				return fmt.Errorf("ICMP listen (run as root): %w", err)
+			}
+		} else {
+			ic = c
+		}
+	}
+	if s.serveDNS {
+		da := s.dnsAddr
+		if strings.TrimSpace(da) == "" {
+			da = ":" + defaultDNSPort
+		}
+		c, err := net.ListenPacket("udp", da)
+		if err != nil {
+			if ic != nil {
+				log.Printf("[server] DNS/UDP listen %q: %v — running ICMP only", da, err)
+			} else if !s.serveICMP {
+				return fmt.Errorf("DNS/UDP listen %q: %w", da, err)
+			} else {
+				// both ICMP and DNS requested; ICMP is down and DNS bind failed
+				return fmt.Errorf("neither transport: ICMP and DNS/UDP %q: %w", da, err)
+			}
+		} else {
+			udp = c
+		}
+	}
+	if ic == nil && udp == nil {
+		return fmt.Errorf("no server transport available (check root for ICMP, -dns-addr for DNS)")
+	}
+	s.tunICM, s.tunDNS = ic, udp
+	if ic != nil {
+		log.Println("[server] listening on ICMP echo (tunnel over ping)")
+	}
+	if udp != nil {
+		log.Printf("[server] listening on DNS/UDP %s (QNAME %s)", udp.LocalAddr().String(), normQName(s.dnsQName))
+	}
+
+	var wg sync.WaitGroup
+	if ic != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.icmpReadLoop(ic)
+		}()
+	}
+	if udp != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.dnsReadLoop(udp)
+		}()
+	}
+	wg.Wait()
+	return nil
+}
+
+func (s *Server) icmpReadLoop(c net.PacketConn) {
 	buf := make([]byte, 65535)
 	for atomic.LoadInt32(&s.closed) == 0 {
-		conn.SetReadDeadline(time.Now().Add(time.Second))
-		n, addr, err := conn.ReadFrom(buf)
+		c.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := c.ReadFrom(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
 			if atomic.LoadInt32(&s.closed) != 0 {
-				return nil
+				return
 			}
 			log.Printf("[server] ICMP read: %v", err)
 			continue
 		}
-
 		msg, err := icmp.ParseMessage(ProtocolICMP, buf[:n])
 		if err != nil || msg.Type != ipv4.ICMPTypeEcho {
 			continue
@@ -170,27 +242,21 @@ func (s *Server) Run() error {
 		if !ok {
 			continue
 		}
-
 		pkt, err := DecodeTunnelPacket(echo.Data)
 		if err != nil || pkt.Magic != MagicRequest {
 			continue
 		}
-
 		if s.manager.ValidateKey(pkt.KeyHash) == nil {
 			atomic.AddUint64(&s.stats.badKey, 1)
 			continue
 		}
-
-		atomic.AddUint64(&s.stats.icmpIn, 1)
-
+		atomic.AddUint64(&s.stats.tunIn, 1)
 		clientKeyHash := pkt.KeyHash
 		s.handlePacket(pkt, addr)
 		s.noteRuleTunnelICMP(clientKeyHash, addr)
-
 		resp := s.dequeueForKey(clientKeyHash)
 		resp.Magic = MagicResponse
 		resp.KeyHash = clientKeyHash
-
 		respData, err := resp.Encode()
 		if err != nil {
 			continue
@@ -204,10 +270,70 @@ func (s *Server) Run() error {
 		if err != nil {
 			continue
 		}
-		conn.WriteTo(rb, addr)
-		atomic.AddUint64(&s.stats.icmpOut, 1)
+		_, _ = c.WriteTo(rb, addr)
+		atomic.AddUint64(&s.stats.tunOut, 1)
 	}
-	return nil
+}
+
+func (s *Server) dnsReadLoop(c net.PacketConn) {
+	buf := make([]byte, 65535)
+	for atomic.LoadInt32(&s.closed) == 0 {
+		c.SetReadDeadline(time.Now().Add(time.Second))
+		n, addr, err := c.ReadFrom(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			if atomic.LoadInt32(&s.closed) != 0 {
+				return
+			}
+			log.Printf("[server] DNS read: %v", err)
+			continue
+		}
+		if n < 12 {
+			continue
+		}
+		m := new(dns.Msg)
+		if err := m.Unpack(buf[:n]); err != nil {
+			continue
+		}
+		if m.Response || len(m.Question) < 1 {
+			continue
+		}
+		if !qnamesMatch(s.dnsQName, m.Question[0].Name) {
+			continue
+		}
+		raw := extractEDNSTunnelPayload(m)
+		if len(raw) == 0 {
+			continue
+		}
+		pkt, err := DecodeTunnelPacket(raw)
+		if err != nil || pkt.Magic != MagicRequest {
+			continue
+		}
+		if s.manager.ValidateKey(pkt.KeyHash) == nil {
+			atomic.AddUint64(&s.stats.badKey, 1)
+			continue
+		}
+		atomic.AddUint64(&s.stats.tunIn, 1)
+		clientKeyHash := pkt.KeyHash
+		s.handlePacket(pkt, addr)
+		s.noteRuleTunnelICMP(clientKeyHash, addr)
+		resp := s.dequeueForKey(clientKeyHash)
+		resp.Magic = MagicResponse
+		resp.KeyHash = clientKeyHash
+		respData, err := resp.Encode()
+		if err != nil {
+			continue
+		}
+		dnsOut, err := buildDNSResponse(m, respData)
+		if err != nil {
+			log.Printf("[server] DNS response: %v", err)
+			continue
+		}
+		_, _ = c.WriteTo(dnsOut, addr)
+		atomic.AddUint64(&s.stats.tunOut, 1)
+	}
 }
 
 // --------------- packet handlers ---------------
@@ -800,13 +926,13 @@ func (s *Server) statsLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			in := atomic.LoadUint64(&s.stats.icmpIn)
-			out := atomic.LoadUint64(&s.stats.icmpOut)
+			in := atomic.LoadUint64(&s.stats.tunIn)
+			out := atomic.LoadUint64(&s.stats.tunOut)
 			bad := atomic.LoadUint64(&s.stats.badKey)
 			s.mu.RLock()
 			conns := len(s.connections)
 			s.mu.RUnlock()
-			log.Printf("[server] stats: icmp_in=%d icmp_out=%d bad_key=%d conns=%d",
+			log.Printf("[server] stats: tun_in=%d tun_out=%d bad_key=%d conns=%d",
 				in, out, bad, conns)
 		case <-s.done:
 			return
