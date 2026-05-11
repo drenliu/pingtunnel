@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -533,6 +534,78 @@ func (s *Server) handleSocksDial(pkt *TunnelPacket) {
 
 // --------------- auto-start ---------------
 
+// RestartListenersAfterKeyHashChange closes listeners and sessions for the given
+// key ID's forwarding rules that used prevKeyHash, then re-binds from config.
+func (s *Server) RestartListenersAfterKeyHashChange(prevKeyHash [16]byte, keyID string) {
+	if atomic.LoadInt32(&s.closed) == 1 {
+		return
+	}
+	var rules []*ForwardRule
+	for _, kc := range s.manager.GetKeys() {
+		if kc.ID == keyID {
+			rules = kc.Rules
+			break
+		}
+	}
+	if rules == nil {
+		rules = []*ForwardRule{}
+	}
+	seen := make(map[string]bool)
+	var mapKeys []string
+	for _, r := range rules {
+		mk := ListenerMapKey(r.Protocol, r.ListenAddr)
+		if !seen[mk] {
+			seen[mk] = true
+			mapKeys = append(mapKeys, mk)
+		}
+	}
+
+	s.mu.Lock()
+	for _, mk := range mapKeys {
+		if ln, ok := s.listenersTCP[mk]; ok {
+			ln.Close()
+			delete(s.listenersTCP, mk)
+		}
+		if uc, ok := s.listenersUDP[mk]; ok {
+			uc.Close()
+			delete(s.listenersUDP, mk)
+		}
+	}
+	var toClose []*ServerConn
+	for _, sc := range s.connections {
+		if sc.keyHash == prevKeyHash {
+			toClose = append(toClose, sc)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, sc := range toClose {
+		s.closeConn(sc)
+	}
+
+	s.sendQueuesMu.Lock()
+	delete(s.sendQueues, prevKeyHash)
+	s.sendQueuesMu.Unlock()
+
+	prefix := hex.EncodeToString(prevKeyHash[:]) + "|"
+	s.ruleTunnelMu.Lock()
+	for k := range s.ruleTunnelClients {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.ruleTunnelClients, k)
+		}
+	}
+	s.ruleTunnelMu.Unlock()
+
+	log.Printf("[server] listeners restarted after tunnel key update (key id %s)", keyID)
+	s.StartConfiguredListeners()
+}
+
+func (s *Server) removeTCPListenerMapKey(mapKey string) {
+	s.mu.Lock()
+	delete(s.listenersTCP, mapKey)
+	s.mu.Unlock()
+}
+
 func (s *Server) StartConfiguredListeners() {
 	keys := s.manager.GetKeys()
 	for _, kc := range keys {
@@ -581,6 +654,11 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 		tc, err := ln.Accept()
 		if err != nil {
 			if atomic.LoadInt32(&s.closed) != 0 {
+				s.removeTCPListenerMapKey(mapKey)
+				return
+			}
+			if errors.Is(err, net.ErrClosed) {
+				s.removeTCPListenerMapKey(mapKey)
 				return
 			}
 			log.Printf("[server] accept: %v", err)

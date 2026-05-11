@@ -263,7 +263,7 @@ func (m *Manager) EnsureKey(key string) *KeyConfig {
 	return kc
 }
 
-func (m *Manager) AddKey(key, listenAddr, targetAddr, protocol string) (*KeyConfig, error) {
+func (m *Manager) AddKey(key, name, listenAddr, targetAddr, protocol string) (*KeyConfig, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -274,7 +274,7 @@ func (m *Manager) AddKey(key, listenAddr, targetAddr, protocol string) (*KeyConf
 	listenAddr = normalizeListenAddr(listenAddr)
 	targetAddr = normalizeTargetAddr(targetAddr)
 	protocol = normalizeProtocol(protocol)
-	kc := &KeyConfig{ID: randID(), Key: key, Name: "", Hash: hash}
+	kc := &KeyConfig{ID: randID(), Key: key, Name: strings.TrimSpace(name), Hash: hash}
 	if listenAddr != "" && targetAddr != "" {
 		kc.Rules = []*ForwardRule{{ID: randID(), ListenAddr: listenAddr, TargetAddr: targetAddr, Protocol: protocol}}
 	}
@@ -297,6 +297,66 @@ func (m *Manager) RemoveKey(id string) error {
 		}
 	}
 	return fmt.Errorf("key not found")
+}
+
+// UpdateKey updates optional tunnel secret and/or display name (nil pointer = leave unchanged).
+// When hashChanged is true, prevHash is the key hash before the update (for restarting listeners).
+func (m *Manager) UpdateKey(id string, keyPtr *string, namePtr *string) (hashChanged bool, prevHash [16]byte, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var kc *KeyConfig
+	for _, k := range m.keys {
+		if k.ID == id {
+			kc = k
+			break
+		}
+	}
+	if kc == nil {
+		return false, [16]byte{}, fmt.Errorf("key not found")
+	}
+	if keyPtr == nil && namePtr == nil {
+		return false, [16]byte{}, fmt.Errorf("nothing to update")
+	}
+
+	newKey := kc.Key
+	if keyPtr != nil {
+		newKey = strings.TrimSpace(*keyPtr)
+		if newKey == "" {
+			return false, [16]byte{}, fmt.Errorf("key cannot be empty")
+		}
+	}
+	newName := kc.Name
+	if namePtr != nil {
+		newName = strings.TrimSpace(*namePtr)
+	}
+
+	newHash := ComputeKeyHash(newKey)
+	oldHash := kc.Hash
+	if newHash != oldHash {
+		for _, o := range m.keys {
+			if o.ID != id && o.Hash == newHash {
+				return false, [16]byte{}, fmt.Errorf("key already exists")
+			}
+		}
+		hashChanged = true
+		prevHash = oldHash
+		m.trafficMu.Lock()
+		if t, ok := m.traffic[oldHash]; ok {
+			delete(m.traffic, oldHash)
+			m.traffic[newHash] = t
+		}
+		m.trafficMu.Unlock()
+		delete(m.byHash, oldHash)
+		kc.Hash = newHash
+		kc.Key = newKey
+		m.byHash[newHash] = kc
+	} else {
+		kc.Key = newKey
+	}
+	kc.Name = newName
+	m.saveLocked()
+	return hashChanged, prevHash, nil
 }
 
 func (m *Manager) AddRule(keyID, listenAddr, targetAddr, protocol string) (*ForwardRule, error) {

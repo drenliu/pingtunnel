@@ -53,9 +53,10 @@ header h1 em{font-style:normal;color:var(--primary)}
 .card{background:var(--surface);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:16px;overflow:hidden}
 .card-hd{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border)}
 .card-hd .name{font-weight:600;font-size:15px}
+.card-hd .name.name-empty{color:var(--muted);font-weight:500}
 .card-hd code{font-family:'SF Mono',Consolas,monospace;font-size:13px;color:var(--muted);background:#f8fafc;
   padding:2px 8px;border-radius:4px;margin-left:10px}
-.card-hd .acts{display:flex;gap:8px;align-items:center}
+.card-hd .acts{display:flex;gap:8px;align-items:center;flex-shrink:0}
 
 table{width:100%;border-collapse:collapse}
 th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
@@ -165,6 +166,7 @@ td code{font-family:'SF Mono',Consolas,monospace;font-size:13px}
   <div class="modal">
     <h3 data-i18n="modal_title"></h3>
     <div class="fg"><label data-i18n="key"></label><input id="nk" data-ph="ph_key"></div>
+    <div class="fg"><label data-i18n="alias"></label><input id="nalias" data-ph="ph_alias"></div>
     <div style="border-top:1px solid var(--border);margin:16px 0 12px;padding-top:12px">
       <div style="font-size:12px;color:var(--muted);font-weight:600;margin-bottom:8px" data-i18n="port_mapping_hint"></div>
       <div class="fg"><label data-i18n="listen_addr"></label><input id="nl" data-ph="ph_listen"></div>
@@ -179,6 +181,19 @@ td code{font-family:'SF Mono',Consolas,monospace;font-size:13px}
   </div>
 </div>
 
+<div class="overlay" id="dlg-edit">
+  <div class="modal">
+    <h3 data-i18n="edit_modal_title"></h3>
+    <input type="hidden" id="eid" value="">
+    <div class="fg"><label data-i18n="key"></label><input id="ek" data-ph="ph_key" autocomplete="off"></div>
+    <div class="fg"><label data-i18n="alias"></label><input id="ename" data-ph="ph_alias" autocomplete="off"></div>
+    <div class="modal-foot">
+      <button type="button" class="btn btn-o" onclick="hideEditKey()" data-i18n="cancel"></button>
+      <button type="button" class="btn btn-p" onclick="saveEditKey()" data-i18n="save_edit"></button>
+    </div>
+  </div>
+</div>
+
 <script>
 const I18N={
   en:{
@@ -188,7 +203,9 @@ const I18N={
     logout:'Logout',
     stat_in:'ICMP In', stat_out:'ICMP Out', stat_conns:'Connections', stat_badkey:'Bad Keys',
     keys_title:'Keys & Forwarding Rules', new_key:'+ New Key', loading:'Loading...',
-    modal_title:'Add Key & Port Mapping', key:'Key',
+    modal_title:'Add Key & Port Mapping', key:'Key', alias:'Alias (optional)', ph_alias:'e.g. Office SSH',
+    edit:'Edit', edit_modal_title:'Edit key & alias', save_edit:'Save', untitled_key:'Unnamed',
+    key_updated:'Saved',
     port_mapping_hint:'PORT MAPPING (at least one rule required)',
     listen_addr:'Listen Address', target_addr:'Target Address', protocol:'Protocol',
     cancel:'Cancel', add:'Add',
@@ -218,7 +235,9 @@ const I18N={
     logout:'退出',
     stat_in:'ICMP 入', stat_out:'ICMP 出', stat_conns:'连接数', stat_badkey:'无效密钥',
     keys_title:'密钥与转发规则', new_key:'+ 新增密钥', loading:'加载中...',
-    modal_title:'添加密钥与端口映射', key:'密钥',
+    modal_title:'添加密钥与端口映射', key:'密钥', alias:'别名（可选）', ph_alias:'例如 办公室 SSH',
+    edit:'修改', edit_modal_title:'修改密钥与别名', save_edit:'保存', untitled_key:'未命名',
+    key_updated:'已保存',
     port_mapping_hint:'端口映射（至少需要一条规则）',
     listen_addr:'监听地址', target_addr:'目标地址', protocol:'协议',
     cancel:'取消', add:'添加',
@@ -267,7 +286,12 @@ function fmt(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).t
 function fmtB(b){if(b>=1073741824)return(b/1073741824).toFixed(2)+' GB';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(1)+' KB';return b+' B'}
 function fmtSpd(b){return fmtB(b)+'/s'}
 function esc(s){let d=document.createElement('div');d.textContent=s;return d.innerHTML}
-function serverIP(){let h=location.hostname;return(h&&h!=='localhost'&&h!=='127.0.0.1')?h:'<SERVER_IP>'}
+function serverIP(){
+  if(typeof PT_WEB_SERVER_IP!=='undefined'&&String(PT_WEB_SERVER_IP).trim())
+    return String(PT_WEB_SERVER_IP).trim();
+  const h=String(window.location.host||window.location.hostname||'').trim();
+  return h||'<SERVER_IP>';
+}
 function normalizeListenJs(addr){
   addr=(addr||'').trim();if(!addr)return addr;
   if(addr[0]===':')return '0.0.0.0'+addr;
@@ -293,12 +317,21 @@ async function api(path,opts){
   return j;
 }
 
+function focusLoginPassword(){
+  const scr=$('login-screen');
+  if(!scr||scr.style.display==='none')return;
+  const p=$('login-pass');
+  if(!p)return;
+  setTimeout(()=>{try{p.focus()}catch(e){}},0);
+}
+
 function showLoginScreen(){
   $('app').style.display='none';
   $('login-screen').style.display='';
   $('login-pass').value='';
   $('login-err').textContent='';
   clearInterval(pollStatus);clearInterval(pollKeys);
+  focusLoginPassword();
 }
 
 function showApp(){
@@ -313,14 +346,14 @@ async function doLogin(e){
   e.preventDefault();
   $('login-err').textContent='';
   const u=$('login-user').value.trim(), p=$('login-pass').value;
-  if(!u||!p){$('login-err').textContent=t('login_empty');return}
+  if(!u||!p){$('login-err').textContent=t('login_empty');focusLoginPassword();return}
   try{
     const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({username:u,password:p})});
     const j=await r.json();
-    if(!r.ok){$('login-err').textContent=j.error||t('login_fail');return}
+    if(!r.ok){$('login-err').textContent=j.error||t('login_fail');focusLoginPassword();return}
     showApp();
-  }catch(e){$('login-err').textContent=t('login_conn_fail')}
+  }catch(e){$('login-err').textContent=t('login_conn_fail');focusLoginPassword()}
 }
 
 function doLogout(){
@@ -352,16 +385,18 @@ async function loadKeys(){
 function render(){
   const el=$('list');
   const ae=document.activeElement;
-  if(ae&&el.contains(ae)&&ae.tagName==='INPUT')return;
+  if(ae&&el.contains(ae)&&(ae.tagName==='INPUT'||ae.tagName==='SELECT'))return;
   const lns=S.listeners||[];
   if(!K||!K.length){el.innerHTML='<div class="empty">'+esc(t('empty_keys'))+'</div>';return}
   let h='';
   for(let i=0;i<K.length;i++){
     const k=K[i], rules=k.rules||[];
-    h+='<div class="card"><div class="card-hd"><div>'+(k.name&&k.name.trim()
-      ?'<span class="name">'+esc(k.name)+'</span><code>'+esc(k.key)+'</code>'
-      :'<span class="name"><code>'+esc(k.key)+'</code></span>')+'</div>'
-      +'<div class="acts"><button class="btn btn-d btn-s" onclick="delKey(\''+k.id+'\')">'+t('delete')+'</button></div></div>';
+    const hasName=k.name&&String(k.name).trim();
+    const titleLeft=hasName?'<span class="name">'+esc(String(k.name).trim())+'</span>'
+      :'<span class="name name-empty">'+esc(t('untitled_key'))+'</span>';
+    h+='<div class="card"><div class="card-hd"><div>'+titleLeft+'</div>'
+      +'<div class="acts"><button type="button" class="btn btn-o btn-s" onclick="showEditKey(\''+k.id+'\')">'+t('edit')+'</button>'
+      +'<button type="button" class="btn btn-d btn-s" onclick="delKey(\''+k.id+'\')">'+t('delete')+'</button></div></div>';
 
     h+='<div class="card-traffic">'
       +'<span class="spd"><span class="arrow up">↑</span> <span class="val">'+fmtSpd(k.speed_in||0)+'</span></span>'
@@ -426,16 +461,43 @@ function render(){
 function showModal(){$('dlg').classList.add('show');$('nk').focus()}
 function hideModal(){$('dlg').classList.remove('show')}
 
+function showEditKey(kid){
+  const k=K.find(x=>x.id===kid);
+  if(!k)return;
+  $('eid').value=kid;
+  $('ek').value=k.key||'';
+  $('ename').value=(k.name&&String(k.name))||'';
+  $('dlg-edit').classList.add('show');
+  $('ek').focus();
+}
+function hideEditKey(){$('dlg-edit').classList.remove('show')}
+
 async function addKey(){
   const key=$('nk').value.trim();
   const listen=$('nl').value.trim(), target=$('nt').value.trim();
   if(!key){toast(t('key_required'),'err');return}
   if(!listen||!target){toast(t('mapping_required'),'err');return}
   const prot=$('nproto').value||'tcp';
+  const alias=$('nalias').value.trim();
   try{await api('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key,listen_addr:listen,target_addr:target,protocol:prot})});
-    $('nk').value='';$('nl').value='';$('nt').value='';$('nproto').value='tcp';
+    body:JSON.stringify({key,name:alias,listen_addr:listen,target_addr:target,protocol:prot})});
+    $('nk').value='';$('nalias').value='';$('nl').value='';$('nt').value='';$('nproto').value='tcp';
     hideModal();toast(t('key_added'),'ok');loadKeys();
+  }catch(e){toast(e.message,'err')}
+}
+
+async function saveEditKey(){
+  const id=$('eid').value;
+  if(!id)return;
+  const key=$('ek').value.trim();
+  const name=$('ename').value.trim();
+  if(!key){toast(t('key_required'),'err');return}
+  try{
+    await api('/api/keys/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key,name})});
+    hideEditKey();
+    toast(t('key_updated'),'ok');
+    loadKeys();
   }catch(e){toast(e.message,'err')}
 }
 
@@ -472,6 +534,7 @@ function toast(msg,cls){
 }
 
 applyLang();
+focusLoginPassword();
 checkSession();
 </script>
 </body>

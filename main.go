@@ -14,10 +14,11 @@ func main() {
 	typeFlag := flag.String("type", "", "server or client")
 	key := flag.String("key", "", "server: web admin password / client: tunnel key")
 	listen := flag.String("l", "", "listen address, e.g. :4455")
-	server := flag.String("s", "", "server address, e.g. 120.46.204.235")
+	server := flag.String("s", "", "server address, e.g. 120.120.120.120")
 	target := flag.String("t", "", "target address, e.g. 192.168.33.1:22")
 	protocol := flag.String("protocol", "tcp", "forwarding protocol: tcp or udp (client only)")
 	webAddr := flag.String("web", ":8080", "web management listen address")
+	webServerIP := flag.String("web-server-ip", "", "server: default -s in web UI client commands (optional; when unset, uses browser address bar host, see location.host)")
 	socksDynamic := flag.Bool("socks-dynamic", false, "server: allow client SOCKS5 dynamic forwarding (-socks)")
 	socks := flag.String("socks", "", "client: local SOCKS5 listen address, e.g. :1080")
 	transport := flag.String("transport", "", "server: both|icmp|dns (default both). client: icmp|dns (default icmp).")
@@ -36,6 +37,7 @@ func main() {
 		fmt.Println("Server options:")
 		fmt.Println("  -key    Web admin password (username: admin)")
 		fmt.Println("  -web    Web management listen address (default :8080)")
+		fmt.Println("  -web-server-ip  Public server IP or hostname for web UI copy-paste client -s (optional)")
 		fmt.Println("  -socks-dynamic  Allow SOCKS5 dynamic port forwarding for clients using -socks")
 		fmt.Println("  -transport  both (default) = ICMP + DNS. Or icmp only, dns only.")
 		fmt.Println("  -dns-addr  UDP listen for DNS part (default :1053; used with both or dns)")
@@ -86,7 +88,7 @@ func main() {
 			log.Fatalf("server: -transport must be both, icmp, or dns, got %q", *transport)
 		}
 		srv := NewServer(mgr, *socksDynamic, srvT, *dnsAddr, *dnsName)
-		StartWeb(*webAddr, *key, mgr, srv)
+		StartWeb(*webAddr, *key, mgr, srv, *webServerIP)
 
 		go func() {
 			<-sigCh

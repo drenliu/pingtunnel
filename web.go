@@ -14,6 +14,18 @@ import (
 //go:embed web.html
 var webHTML string
 
+func webPageHTML(defaultServerIP string) string {
+	s := strings.TrimSpace(defaultServerIP)
+	if s == "" {
+		return webHTML
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		return webHTML
+	}
+	return strings.Replace(webHTML, "</head>", "<script>var PT_WEB_SERVER_IP="+string(b)+";</script>\n</head>", 1)
+}
+
 type StatusInfo struct {
 	ICMPIn      uint64   `json:"icmp_in"`
 	ICMPOut     uint64   `json:"icmp_out"`
@@ -22,12 +34,13 @@ type StatusInfo struct {
 	Listeners   []string `json:"listeners"`
 }
 
-func StartWeb(addr, password string, mgr *Manager, srv *Server) {
+func StartWeb(addr, password string, mgr *Manager, srv *Server, webServerIP string) {
 	ws := &webServer{
 		mgr:      mgr,
 		srv:      srv,
 		password: password,
 		sessions: make(map[string]time.Time),
+		htmlPage: webPageHTML(webServerIP),
 	}
 	log.Printf("[web] management UI on http://%s  (user: admin)", addr)
 	go func() {
@@ -43,6 +56,7 @@ type webServer struct {
 	password string
 	sessions map[string]time.Time
 	sessMu   sync.Mutex
+	htmlPage string
 }
 
 func (ws *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -50,7 +64,7 @@ func (ws *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if p == "/" || p == "/index.html" {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(webHTML))
+		w.Write([]byte(ws.htmlPage))
 		return
 	}
 
@@ -219,6 +233,7 @@ func (ws *webServer) apiListKeys(w http.ResponseWriter) {
 func (ws *webServer) apiAddKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Key        string `json:"key"`
+		Name       string `json:"name"`
 		ListenAddr string `json:"listen_addr"`
 		TargetAddr string `json:"target_addr"`
 		Protocol   string `json:"protocol"`
@@ -231,7 +246,7 @@ func (ws *webServer) apiAddKey(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, "key is required", 400)
 		return
 	}
-	kc, err := ws.mgr.AddKey(req.Key, req.ListenAddr, req.TargetAddr, req.Protocol)
+	kc, err := ws.mgr.AddKey(req.Key, req.Name, req.ListenAddr, req.TargetAddr, req.Protocol)
 	if err != nil {
 		jsonErr(w, err.Error(), 400)
 		return
@@ -247,6 +262,33 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 		if err := ws.mgr.RemoveKey(parts[0]); err != nil {
 			jsonErr(w, err.Error(), 404)
 			return
+		}
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		return
+	}
+
+	if len(parts) == 1 && r.Method == "PATCH" {
+		var req struct {
+			Key  *string `json:"key"`
+			Name *string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonErr(w, "invalid JSON", 400)
+			return
+		}
+		hashChanged, prevHash, err := ws.mgr.UpdateKey(parts[0], req.Key, req.Name)
+		if err != nil {
+			code := 400
+			if err.Error() == "key not found" {
+				code = 404
+			}
+			jsonErr(w, err.Error(), code)
+			return
+		}
+		if hashChanged {
+			ws.srv.RestartListenersAfterKeyHashChange(prevHash, parts[0])
+		} else {
+			ws.srv.StartConfiguredListeners()
 		}
 		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 		return
