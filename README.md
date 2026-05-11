@@ -10,6 +10,7 @@ TCP and UDP port forwarding over the **ICMP (Ping) protocol** or, alternatively,
 - **DNS Tunneling (optional)** — Same protocol over DNS-like UDP/EDNS0. The **server** can run **ICMP and DNS at the same time** (default `-transport both`). The **client** still picks **one** carrier: `-transport icmp` or `-transport dns`.
 - **Reliable Transport** — Sequence numbers, ACKs, automatic retransmission, and out-of-order buffering for lossy networks
 - **Web Management** — Built-in Web UI for managing tunnel keys and port forwarding rules
+- **Key aliases** — Optional display name per key (`name` in `pingtunnel.json`); edit tunnel secret and alias from the UI
 - **Authentication** — Web UI secured with admin login and session-based auth
 - **Traffic Statistics** — Real-time speed and historical traffic totals, grouped by key
 - **Connection Monitoring** — Live view of active TCP connections with client IPs
@@ -58,6 +59,7 @@ sudo ./pingtunnel -type server -key <admin_password>
 |------|-------------|---------|
 | `-key` | Web admin login password (username is `admin`) | Required |
 | `-web` | Web management listen address | `:8080` |
+| `-web-server-ip` | Default `-s` host in Web UI copy-paste client commands (optional; see **Web UI** below) | *(empty)* |
 | `-transport` | `both` (default): ICMP and DNS. Or `icmp` or `dns` only | `both` |
 | `-dns-addr` | UDP port for the DNS part (when `both` or `dns`) | `:1053` |
 | `-dns-name` | QNAME for DNS; must match **DNS** clients’ `-dns-name` | `c.pingt.local` |
@@ -67,10 +69,18 @@ After starting, open `http://<server_ip>:8080` in your browser and log in with `
 
 Use the Web UI to add tunnel keys and forwarding rules:
 
-- **Key** — Authentication key used by clients to connect
+- **Key** — Authentication secret used by clients (`-key`); stored in config as `key`
+- **Alias** (optional) — Display label only (`name` in `pingtunnel.json`); does not change authentication
 - **Listen Address** — Port the server listens on (e.g. `4455` or `:4455`)
 - **Target Address** — Destination the client forwards traffic to (e.g. `192.168.33.1:22`)
 - **Protocol** — `TCP` (default) or `UDP`; TCP and UDP may use the same listen port as separate rules
+- **Edit** — Per-key **Edit** updates alias and/or tunnel key. Changing the secret changes the key hash; the server restarts port-forward listeners for that key’s rules only (existing clients must use the new `-key`).
+
+**Client command templates (`-s` in the copied command):**
+
+- If the server was started with **`-web-server-ip <host>`**, that value is used for `-s`.
+- Otherwise the UI uses the **browser address bar host** (`window.location.host`: hostname and non-default port, e.g. `203.0.113.1:8080` when you open `http://203.0.113.1:8080/`). If the host is empty, the placeholder `<SERVER_IP>` is shown.
+- **ICMP clients** usually need `-s` as the tunnel endpoint (public IP or DNS name), **without** the Web UI port. If you manage the server via `http://public-ip:8080`, set **`-web-server-ip public-ip`** (or a hostname) so copy-paste commands omit the `:8080` web port.
 
 ### Client
 
@@ -110,6 +120,8 @@ If the server does not enable `-socks-dynamic`, SOCKS-only clients receive an im
 
 ```bash
 sudo ./pingtunnel -type server -key admin123
+# optional: so Web UI copy-paste uses this host for -s (see Web UI section)
+# sudo ./pingtunnel -type server -key admin123 -web-server-ip 120.120.120.120
 ```
 
 Open `http://120.120.120.120:8080`, log in, and add a rule:
@@ -128,7 +140,7 @@ sudo ./pingtunnel -type client -l :4455 -s 120.120.120.120 -t 192.168.33.1:22 -k
 SSH to the server's forwarded port from any machine:
 
 ```bash
-ssh user@120.46.204.235 -p 4455
+ssh user@120.120.120.120 -p 4455
 ```
 
 Traffic path: `SSH Client → Server:4455 → ICMP Tunnel → Internal Client → 192.168.33.1:22`

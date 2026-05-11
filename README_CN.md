@@ -10,6 +10,7 @@
 - **DNS 隧道（可选）** — 同样协议经 DNS 式 UDP/EDNS0 传输。服务端**可同时**开 ICMP 与 DNS（默认 `-transport both`）；**客户端**仍只选一种：`-transport icmp` 或 `-transport dns`。
 - **可靠传输** — 序列号、ACK 确认、自动重传、乱序缓冲，适应高丢包环境
 - **Web 管理** — 内置 Web UI，管理隧道密钥和端口转发规则
+- **密钥别名** — 每条密钥可选展示名（配置中 `name`）；可在界面修改别名与隧道密钥
 - **登录认证** — Web 管理界面使用 admin 账号 + 密码登录，Session 鉴权
 - **流量统计** — 实时网速、历史流量汇总，按密钥分组统计
 - **连接监控** — 实时显示活跃 TCP/UDP 会话及其客户端地址
@@ -54,6 +55,7 @@ sudo ./pingtunnel -type server -key <管理密码>
 |------|------|--------|
 | `-key` | Web 管理登录密码（用户名固定为 `admin`） | 必填 |
 | `-web` | Web 管理监听地址 | `:8080` |
+| `-web-server-ip` | Web 界面里复制出的客户端命令中 `-s` 的默认值（可选；见下文 **Web 界面**） | 空 |
 | `-transport` | `both`（默认）同时开 ICMP+DNS，或只开 `icmp` / `dns` | `both` |
 | `-dns-addr` | 含 DNS 时的 UDP 监听，如 `:1053` | `:1053` |
 | `-dns-name` | 含 DNS 时 QNAME，与走 DNS 的客户端一致 | `c.pingt.local` |
@@ -63,10 +65,18 @@ sudo ./pingtunnel -type server -key <管理密码>
 
 在 Web 界面中添加隧道密钥和端口转发规则：
 
-- **Key** — 客户端连接使用的认证密钥
+- **密钥（Key）** — 客户端认证用的隧道密钥（`-key`），配置字段为 `key`
+- **别名（可选）** — 仅用于展示的名称（配置字段 `name`），不参与认证
 - **Listen Address** — 服务器端监听的端口（如 `4455` 或 `:4455`）
 - **Target Address** — 客户端需要转发到的目标地址（如 `192.168.33.1:22`）
 - **Protocol** — `TCP`（默认）或 `UDP`；同一监听端口可同时配置 TCP 与 UDP 两条独立规则
+- **修改** — 每条密钥旁的「修改」可更新别名和/或隧道密钥。修改密钥会改变哈希，服务端仅重启该密钥相关规则的端口监听，客户端需改用新的 `-key` 重连。
+
+**Web 界面里客户端命令中的 `-s`：**
+
+- 若启动服务端时指定 **`-web-server-ip <主机或IP>`**，复制命令中的 `-s` 使用该值。
+- 未指定时，使用**浏览器地址栏的 host**（`window.location.host`：主机名 + 非默认端口，例如打开 `http://203.0.113.1:8080/` 时为 `203.0.113.1:8080`）。若无法取得 host，则显示占位符 `<SERVER_IP>`。
+- **走 ICMP 的客户端** 通常需要 `-s` 为隧道对端公网 IP/域名，**不应**带 Web 管理端口。若通过 `http://公网IP:8080` 打开管理页，建议设置 **`-web-server-ip 公网IP`**（或域名），使复制出的命令里 `-s` 不含 `:8080`。
 
 ### 客户端
 
@@ -108,6 +118,8 @@ sudo ./pingtunnel -type client -l <监听地址> -s <服务器IP> -t <目标地�
 
 ```bash
 sudo ./pingtunnel -type server -key admin123
+# 可选：让 Web 里复制的客户端命令 -s 固定为该地址（见上文 Web 界面说明）
+# sudo ./pingtunnel -type server -key admin123 -web-server-ip 120.120.120.120
 ```
 
 打开 `http://120.120.120.120:8080`，登录后添加：
