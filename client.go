@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -22,6 +24,7 @@ type Client struct {
 	transport  string
 	dnsQName   string
 	key        [16]byte
+	clientID   uint32
 
 	// tunConn + tunPeer: ICMP echo or plain UDP to server (DNS transport)
 	tunConn  net.PacketConn
@@ -67,6 +70,7 @@ func NewClient(listenAddr, serverAddr, targetAddr, key, protocol, socksAddr, tra
 		transport:   normalizeClientTransport(transport),
 		dnsQName:    strings.TrimSpace(dnsName),
 		key:         ComputeKeyHash(key),
+		clientID:    genClientID(),
 		connections: make(map[uint32]*ClientConn),
 		pending:     make(map[uint32]bool),
 		socksWait:   make(map[uint32]chan bool),
@@ -238,6 +242,7 @@ func (c *Client) sender() {
 
 		pkt.Magic = MagicRequest
 		pkt.KeyHash = c.key
+		pkt.ClientID = c.clientID
 
 		payload, err := pkt.Encode()
 		if err != nil {
@@ -300,7 +305,7 @@ func (c *Client) receiver() {
 				continue
 			}
 			pkt, e := DecodeTunnelPacket(data)
-			if e != nil || pkt.Magic != MagicResponse || pkt.KeyHash != c.key {
+			if e != nil || pkt.Magic != MagicResponse || pkt.KeyHash != c.key || pkt.ClientID != c.clientID {
 				continue
 			}
 			c.handlePacket(pkt)
@@ -318,7 +323,7 @@ func (c *Client) receiver() {
 			continue
 		}
 		pkt, err := DecodeTunnelPacket(echo.Data)
-		if err != nil || pkt.Magic != MagicResponse || pkt.KeyHash != c.key {
+		if err != nil || pkt.Magic != MagicResponse || pkt.KeyHash != c.key || pkt.ClientID != c.clientID {
 			continue
 		}
 		c.handlePacket(pkt)
@@ -569,4 +574,15 @@ func (c *Client) enqueue(pkt *TunnelPacket) {
 	default:
 		log.Println("[client] send queue full, dropping")
 	}
+}
+
+func genClientID() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		id := binary.BigEndian.Uint32(b[:])
+		if id != 0 {
+			return id
+		}
+	}
+	return uint32(time.Now().UnixNano())
 }

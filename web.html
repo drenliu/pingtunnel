@@ -194,6 +194,22 @@ td code{font-family:'SF Mono',Consolas,monospace;font-size:13px}
   </div>
 </div>
 
+<div class="overlay" id="dlg-rule-edit">
+  <div class="modal">
+    <h3 data-i18n="edit_rule_title"></h3>
+    <input type="hidden" id="er-kid" value="">
+    <input type="hidden" id="er-rid" value="">
+    <div class="fg"><label data-i18n="listen_addr"></label><input id="er-listen" data-ph="ph_listen" autocomplete="off"></div>
+    <div class="fg"><label data-i18n="target_addr"></label><input id="er-target" data-ph="ph_target" autocomplete="off"></div>
+    <div class="fg"><label data-i18n="protocol"></label><select id="er-proto" style="width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:6px;font-size:14px">
+      <option value="tcp">TCP</option><option value="udp">UDP</option></select></div>
+    <div class="modal-foot">
+      <button type="button" class="btn btn-o" onclick="hideEditRule()" data-i18n="cancel"></button>
+      <button type="button" class="btn btn-p" onclick="saveEditRule()" data-i18n="save_rule"></button>
+    </div>
+  </div>
+</div>
+
 <script>
 const I18N={
   en:{
@@ -205,6 +221,7 @@ const I18N={
     keys_title:'Keys & Forwarding Rules', new_key:'+ New Key', loading:'Loading...',
     modal_title:'Add Key & Port Mapping', key:'Key', alias:'Alias (optional)', ph_alias:'e.g. Office SSH',
     edit:'Edit', edit_modal_title:'Edit key & alias', save_edit:'Save', untitled_key:'Unnamed',
+    edit_rule:'Edit Rule', edit_rule_title:'Edit forwarding rule', save_rule:'Save Rule',
     key_updated:'Saved',
     port_mapping_hint:'PORT MAPPING (at least one rule required)',
     listen_addr:'Listen Address', target_addr:'Target Address', protocol:'Protocol',
@@ -223,7 +240,7 @@ const I18N={
     key_required:'Key is required',
     mapping_required:'Port mapping (listen + target) is required',
     key_added:'Key added', key_deleted:'Key deleted',
-    rule_added:'Rule added', rule_removed:'Rule removed',
+    rule_added:'Rule added', rule_removed:'Rule removed', rule_updated:'Rule updated',
     both_required:'Both fields required', copy_fail:'Copy failed',
     confirm_delete:'Delete this key and all its rules?',
     lang_toggle:'中文'
@@ -237,6 +254,7 @@ const I18N={
     keys_title:'密钥与转发规则', new_key:'+ 新增密钥', loading:'加载中...',
     modal_title:'添加密钥与端口映射', key:'密钥', alias:'别名（可选）', ph_alias:'例如 办公室 SSH',
     edit:'修改', edit_modal_title:'修改密钥与别名', save_edit:'保存', untitled_key:'未命名',
+    edit_rule:'修改规则', edit_rule_title:'修改转发规则', save_rule:'保存规则',
     key_updated:'已保存',
     port_mapping_hint:'端口映射（至少需要一条规则）',
     listen_addr:'监听地址', target_addr:'目标地址', protocol:'协议',
@@ -255,7 +273,7 @@ const I18N={
     key_required:'密钥不能为空',
     mapping_required:'端口映射（监听 + 目标）不能为空',
     key_added:'密钥已添加', key_deleted:'密钥已删除',
-    rule_added:'规则已添加', rule_removed:'规则已删除',
+    rule_added:'规则已添加', rule_removed:'规则已删除', rule_updated:'规则已更新',
     both_required:'两个字段都不能为空', copy_fail:'复制失败',
     confirm_delete:'确定删除该密钥及其所有规则？',
     lang_toggle:'EN'
@@ -418,7 +436,9 @@ function render(){
         h+='<tr><td><code>'+esc(r.listen_addr)+'</code></td><td><code>'+esc(r.target_addr)+'</code></td><td><code>'+pr+'</code></td>'
           +'<td>'+icmpShow+'</td>'
           +'<td><span class="badge '+(on?'badge-on':'badge-off')+'">'+(on?t('active'):t('idle'))+'</span></td>'
-          +'<td style="text-align:right"><button class="btn-g" onclick="delRule(\''+k.id+"','"+r.id+"')\">✕</button></td></tr>"
+          +'<td style="text-align:right;white-space:nowrap">'
+          +'<button class="btn btn-o btn-s" type="button" style="margin-right:8px" onclick="showEditRule(\''+k.id+"','"+r.id+'\')">'+t('edit_rule')+'</button>'
+          +'<button class="btn-g" type="button" onclick="delRule(\''+k.id+"','"+r.id+'\')">✕</button></td></tr>'
           +'<tr><td colspan="6" class="cmd-row"><div class="cmd-box"><code>'+esc(cmd)+'</code>'
           +'<button class="copy-btn" onclick="copyCmd(this)">'+t('copy')+'</button></div></td></tr>';
       }
@@ -472,6 +492,21 @@ function showEditKey(kid){
 }
 function hideEditKey(){$('dlg-edit').classList.remove('show')}
 
+function showEditRule(kid,rid){
+  const k=K.find(x=>x.id===kid);
+  if(!k||!k.rules)return;
+  const r=k.rules.find(x=>x.id===rid);
+  if(!r)return;
+  $('er-kid').value=kid;
+  $('er-rid').value=rid;
+  $('er-listen').value=r.listen_addr||'';
+  $('er-target').value=r.target_addr||'';
+  $('er-proto').value=((r.protocol||'tcp').toLowerCase()==='udp')?'udp':'tcp';
+  $('dlg-rule-edit').classList.add('show');
+  $('er-listen').focus();
+}
+function hideEditRule(){$('dlg-rule-edit').classList.remove('show')}
+
 async function addKey(){
   const key=$('nk').value.trim();
   const listen=$('nl').value.trim(), target=$('nt').value.trim();
@@ -521,11 +556,47 @@ async function delRule(kid,rid){
   catch(e){toast(e.message,'err')}
 }
 
+async function saveEditRule(){
+  const kid=$('er-kid').value;
+  const rid=$('er-rid').value;
+  const listen=$('er-listen').value.trim();
+  const target=$('er-target').value.trim();
+  const protocol=$('er-proto').value||'tcp';
+  if(!listen||!target){toast(t('both_required'),'err');return}
+  try{
+    await api('/api/keys/'+kid+'/rules/'+rid,{method:'PATCH',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({listen_addr:listen,target_addr:target,protocol})});
+    hideEditRule();
+    toast(t('rule_updated'),'ok');
+    loadKeys();
+  }catch(e){toast(e.message,'err')}
+}
+
 function copyCmd(btn){
   const code=btn.parentElement.querySelector('code');
-  navigator.clipboard.writeText(code.textContent).then(()=>{
-    btn.textContent=t('copied');setTimeout(()=>{btn.textContent=t('copy')},1500);
-  }).catch(()=>{toast(t('copy_fail'),'err')});
+  const txt=code?code.textContent:'';
+  const done=()=>{btn.textContent=t('copied');setTimeout(()=>{btn.textContent=t('copy')},1500);};
+  if(navigator.clipboard&&window.isSecureContext){
+    navigator.clipboard.writeText(txt).then(done).catch(()=>legacyCopy(txt,done));
+    return;
+  }
+  legacyCopy(txt,done);
+}
+
+function legacyCopy(txt,onOk){
+  try{
+    const ta=document.createElement('textarea');
+    ta.value=txt;
+    ta.style.position='fixed';
+    ta.style.left='-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok=document.execCommand('copy');
+    ta.remove();
+    if(ok){onOk();return;}
+  }catch(e){}
+  toast(t('copy_fail'),'err');
 }
 
 function toast(msg,cls){

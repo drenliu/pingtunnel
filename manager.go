@@ -249,6 +249,17 @@ func (m *Manager) GetKeys() []*KeyConfig {
 	return out
 }
 
+func (m *Manager) GetKeyByID(id string) *KeyConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, kc := range m.keys {
+		if kc.ID == id {
+			return kc
+		}
+	}
+	return nil
+}
+
 func (m *Manager) EnsureKey(key string) *KeyConfig {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -399,6 +410,47 @@ func (m *Manager) RemoveRule(keyID, ruleID string) error {
 		}
 	}
 	return fmt.Errorf("key not found")
+}
+
+func (m *Manager) UpdateRule(keyID, ruleID, listenAddr, targetAddr, protocol string) (*ForwardRule, string, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	listenAddr = normalizeListenAddr(listenAddr)
+	targetAddr = normalizeTargetAddr(targetAddr)
+	protocol = normalizeProtocol(protocol)
+
+	for _, kc := range m.keys {
+		if kc.ID != keyID {
+			continue
+		}
+		var rule *ForwardRule
+		for _, r := range kc.Rules {
+			if r.ID == ruleID {
+				rule = r
+				break
+			}
+		}
+		if rule == nil {
+			return nil, "", "", fmt.Errorf("rule not found")
+		}
+		for _, r := range kc.Rules {
+			if r.ID == ruleID {
+				continue
+			}
+			if r.ListenAddr == listenAddr && r.TargetAddr == targetAddr && r.Protocol == protocol {
+				return nil, "", "", fmt.Errorf("rule already exists")
+			}
+		}
+		oldMapKey := ListenerMapKey(rule.Protocol, rule.ListenAddr)
+		rule.ListenAddr = listenAddr
+		rule.TargetAddr = targetAddr
+		rule.Protocol = protocol
+		newMapKey := ListenerMapKey(rule.Protocol, rule.ListenAddr)
+		m.saveLocked()
+		return rule, oldMapKey, newMapKey, nil
+	}
+	return nil, "", "", fmt.Errorf("key not found")
 }
 
 // normalizeListenAddr ensures a listen address has host:port form.

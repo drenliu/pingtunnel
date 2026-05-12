@@ -327,6 +327,39 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 		return
 	}
 
+	if len(parts) == 3 && parts[1] == "rules" && r.Method == "PATCH" {
+		var req struct {
+			ListenAddr string `json:"listen_addr"`
+			TargetAddr string `json:"target_addr"`
+			Protocol   string `json:"protocol"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonErr(w, "invalid JSON", 400)
+			return
+		}
+		if strings.TrimSpace(req.ListenAddr) == "" || strings.TrimSpace(req.TargetAddr) == "" {
+			jsonErr(w, "listen_addr and target_addr are required", 400)
+			return
+		}
+		rule, oldMapKey, newMapKey, err := ws.mgr.UpdateRule(parts[0], parts[2], req.ListenAddr, req.TargetAddr, req.Protocol)
+		if err != nil {
+			code := 400
+			if err.Error() == "key not found" || err.Error() == "rule not found" {
+				code = 404
+			}
+			jsonErr(w, err.Error(), code)
+			return
+		}
+		kc := ws.mgr.GetKeyByID(parts[0])
+		if kc != nil {
+			ws.srv.RestartListenersAfterRuleChange(kc.Hash, oldMapKey, newMapKey)
+		} else {
+			ws.srv.StartConfiguredListeners()
+		}
+		json.NewEncoder(w).Encode(rule)
+		return
+	}
+
 	http.NotFound(w, r)
 }
 

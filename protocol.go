@@ -29,14 +29,15 @@ const (
 
 	MaxPayloadSize = 1300
 
-	// Magic(4) + KeyHash(16) + Cmd(1) + Flags(1) + ConnID(4) + Seq(4) + DataLen(2)
-	HeaderSize   = 32
+	// Magic(4) + KeyHash(16) + ClientID(4) + Cmd(1) + Flags(1) + ConnID(4) + Seq(4) + DataLen(2)
+	HeaderSize   = 36
 	ProtocolICMP = 1
 )
 
 type TunnelPacket struct {
 	Magic   uint32
 	KeyHash [16]byte
+	ClientID uint32
 	Cmd     uint8
 	Flags   uint8
 	ConnID  uint32
@@ -54,6 +55,7 @@ func (p *TunnelPacket) Encode() ([]byte, error) {
 
 	binary.Write(buf, binary.BigEndian, p.Magic)
 	buf.Write(p.KeyHash[:])
+	binary.Write(buf, binary.BigEndian, p.ClientID)
 	buf.WriteByte(p.Cmd)
 	buf.WriteByte(p.Flags)
 	binary.Write(buf, binary.BigEndian, p.ConnID)
@@ -79,6 +81,7 @@ func DecodeTunnelPacket(data []byte) (*TunnelPacket, error) {
 	}
 
 	r.Read(p.KeyHash[:])
+	binary.Read(r, binary.BigEndian, &p.ClientID)
 	p.Cmd, _ = r.ReadByte()
 	p.Flags, _ = r.ReadByte()
 	binary.Read(r, binary.BigEndian, &p.ConnID)

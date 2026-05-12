@@ -21,6 +21,7 @@ func TestTunnelPacketEncodeDecodeRoundtrip(t *testing.T) {
 	p := &TunnelPacket{
 		Magic:   MagicRequest,
 		KeyHash: key,
+		ClientID: 0x10203,
 		Cmd:     CmdData,
 		Flags:   FlagMore,
 		ConnID:  0x4030201,
@@ -80,9 +81,10 @@ func TestDecodeTunnelPacketInvalidMagic(t *testing.T) {
 
 func TestDecodeTunnelPacketShortDataField(t *testing.T) {
 	buf := new(bytes.Buffer)
-	// MagicRequest + key + cmd + flags + conn + seq + dataLen=5 but only 2 data bytes
+	// MagicRequest + key + clientID + cmd + flags + conn + seq + dataLen=5 but only 2 data bytes
 	writeU32BE(buf, MagicRequest)
 	buf.Write(make([]byte, 16))
+	writeU32BE(buf, 7)
 	buf.WriteByte(CmdPing)
 	buf.WriteByte(0)
 	writeU32BE(buf, 1)
