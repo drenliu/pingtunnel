@@ -79,7 +79,7 @@ Use the Web UI to add tunnel keys and forwarding rules:
 **Client command templates (`-s` in the copied command):**
 
 - If the server was started with **`-web-server-ip <host>`**, that value is used for `-s`.
-- Otherwise the UI uses the **browser address bar host** (`window.location.host`: hostname and non-default port, e.g. `203.0.113.1:8080` when you open `http://203.0.113.1:8080/`). If the host is empty, the placeholder `<SERVER_IP>` is shown.
+- Otherwise the UI uses the **browser address bar host** (`window.location.host`: hostname and non-default port, e.g. `120.120.120.120:8080` when you open `http://120.120.120.120:8080/`). If the host is empty, the placeholder `<SERVER_IP>` is shown.
 - **ICMP clients** usually need `-s` as the tunnel endpoint (public IP or DNS name), **without** the Web UI port. If you manage the server via `http://public-ip:8080`, set **`-web-server-ip public-ip`** (or a hostname) so copy-paste commands omit the `:8080` web port.
 
 ### Client
