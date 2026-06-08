@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -52,9 +53,10 @@ type Server struct {
 	connections  map[uint32]*ServerConn
 	nextConnID   uint32
 
-	mu     sync.RWMutex
-	closed int32
-	done   chan struct{}
+	mu        sync.RWMutex
+	closed    int32
+	done      chan struct{}
+	bootEpoch uint32 // changes each server process start; clients use it to detect restart
 
 	stats struct {
 		tunIn      uint64
@@ -99,6 +101,7 @@ type ruleTunnelState struct {
 func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dnsUpstream string) *Server {
 	si, sd := parseServerTransports(transport)
 	da, qn := finalizeDNSServerAddr(sd, dnsAddr, dnsQName)
+	bootEpoch := genBootEpoch()
 	return &Server{
 		manager:           mgr,
 		socksDynamic:      socksDynamic,
@@ -115,6 +118,8 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dn
 		udpSessions:       make(map[string]*ServerConn),
 		connections:       make(map[uint32]*ServerConn),
 		done:              make(chan struct{}),
+		bootEpoch:         bootEpoch,
+		nextConnID:        bootEpoch, // avoid connID reuse across restarts (stale CmdClose)
 	}
 }
 
@@ -208,7 +213,7 @@ func (s *Server) Run() error {
 	}
 	s.tunICM, s.tunDNS = ic, udp
 	if ic != nil {
-		log.Println("[server] listening on ICMP echo (tunnel over ping)")
+		log.Printf("[server] listening on ICMP echo (tunnel over ping, epoch=%08x)", s.bootEpoch)
 	}
 	if udp != nil {
 		log.Printf("[server] listening on DNS/UDP %s (QNAME %s)", udp.LocalAddr().String(), normQName(s.dnsQName))
@@ -438,7 +443,7 @@ func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
 		}
 	}
 	_, _, wasOnline := s.routeKeyForListener(pkt.KeyHash, mapKey)
-	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck})
+	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck, Data: s.setupAckPayload()})
 	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, mapKey, from)
 	if !wasOnline {
 		log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s", listenAddr, targetAddr, protocol)
@@ -513,11 +518,17 @@ func (s *Server) handleSocksRegister(pkt *TunnelPacket, from net.Addr) {
 		return
 	}
 	_, _, wasOnline := s.routeKeyForListener(pkt.KeyHash, "socks-dynamic")
-	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck})
+	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck, Data: s.setupAckPayload()})
 	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, "socks-dynamic", from)
 	if !wasOnline {
 		log.Printf("[server] SOCKS dynamic forwarding registered for tunnel key")
 	}
+}
+
+func (s *Server) setupAckPayload() []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, s.bootEpoch)
+	return b
 }
 
 func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {

@@ -45,13 +45,14 @@ type Client struct {
 	socksMu       sync.Mutex
 	nextSocksConn uint32
 
-	tunSeq     uint32
-	dnsUDPSize uint32 // atomic: negotiated EDNS UDP payload size (DNS transport)
-	mu         sync.RWMutex
-	closed     int32
-	done       chan struct{}
-	setupDone  chan struct{}
-	setupFail  chan struct{}
+	tunSeq      uint32
+	dnsUDPSize  uint32 // atomic: negotiated EDNS UDP payload size (DNS transport)
+	serverEpoch uint32 // atomic: last seen server boot epoch (detect restart)
+	mu          sync.RWMutex
+	closed      int32
+	done        chan struct{}
+	setupDone   chan struct{}
+	setupFail   chan struct{}
 }
 
 type ClientConn struct {
@@ -61,8 +62,9 @@ type ClientConn struct {
 	reliSend *ReliableSend
 	reliRecv *ReliableRecv
 
-	idleMu    sync.Mutex
-	idleTimer *time.Timer
+	silentClose int32 // atomic: skip CmdClose notify (server restart session reset)
+	idleMu      sync.Mutex
+	idleTimer   *time.Timer
 }
 
 func NewClient(listenAddr, serverAddr, targetAddr, key, protocol, socksAddr, transport, dnsName string) *Client {
@@ -370,6 +372,7 @@ func (c *Client) receiver() {
 func (c *Client) handlePacket(pkt *TunnelPacket) {
 	switch pkt.Cmd {
 	case CmdSetupAck:
+		c.noteServerEpoch(pkt.Data)
 		select {
 		case <-c.setupDone:
 		default:
@@ -408,19 +411,24 @@ func (c *Client) handleSocksDialAck(pkt *TunnelPacket) {
 }
 
 func (c *Client) handleConnect(pkt *TunnelPacket) {
+	var stale *ClientConn
 	c.mu.Lock()
 	if cc, exists := c.connections[pkt.ConnID]; exists {
-		c.mu.Unlock()
-		_ = cc
-		c.enqueue(&TunnelPacket{Cmd: CmdConnectAck, ConnID: pkt.ConnID})
-		return
+		delete(c.connections, pkt.ConnID)
+		stale = cc
 	}
 	if c.pending[pkt.ConnID] {
 		c.mu.Unlock()
+		if stale != nil {
+			c.closeClientConn(stale, true)
+		}
 		return
 	}
 	c.pending[pkt.ConnID] = true
 	c.mu.Unlock()
+	if stale != nil {
+		c.closeClientConn(stale, true)
+	}
 
 	target := string(pkt.Data)
 	if target == "" {
@@ -479,8 +487,10 @@ func (c *Client) readTarget(cc *ClientConn) {
 		cc.tcpConn.Close()
 		cc.reliSend.Close()
 		cc.reliRecv.Close()
-		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: cc.id})
-		log.Printf("[client] conn %d: target closed", cc.id)
+		if atomic.LoadInt32(&cc.silentClose) == 0 {
+			c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: cc.id})
+			log.Printf("[client] conn %d: target closed", cc.id)
+		}
 	}()
 
 	chunk := MaxPayloadSize
@@ -706,6 +716,59 @@ func (c *Client) dnsProbeRoundTrip(qname string, udpSize uint16) bool {
 		}
 		return true
 	}
+}
+
+func (c *Client) noteServerEpoch(data []byte) {
+	if len(data) < 4 {
+		return
+	}
+	epoch := binary.BigEndian.Uint32(data[:4])
+	prev := atomic.LoadUint32(&c.serverEpoch)
+	if prev != 0 && epoch != prev {
+		c.resetTunnelSessions()
+		c.enqueueSetupRefresh()
+		log.Printf("[client] server restarted (epoch %08x -> %08x), tunnel sessions cleared", prev, epoch)
+	}
+	atomic.StoreUint32(&c.serverEpoch, epoch)
+}
+
+func (c *Client) enqueueSetupRefresh() {
+	if c.wantPortForward() {
+		data := fmt.Sprintf("%s|%s|%s", c.listenAddr, c.targetAddr, c.protocol)
+		c.enqueue(&TunnelPacket{Cmd: CmdSetup, Data: []byte(data)})
+		return
+	}
+	if c.socksAddr != "" {
+		c.enqueue(&TunnelPacket{Cmd: CmdSocksRegister})
+	}
+}
+
+func (c *Client) resetTunnelSessions() {
+	c.mu.Lock()
+	var conns []*ClientConn
+	for id, cc := range c.connections {
+		conns = append(conns, cc)
+		delete(c.connections, id)
+	}
+	c.pending = make(map[uint32]bool)
+	c.mu.Unlock()
+	for _, cc := range conns {
+		c.closeClientConn(cc, true)
+	}
+}
+
+func (c *Client) closeClientConn(cc *ClientConn, silent bool) {
+	if silent {
+		atomic.StoreInt32(&cc.silentClose, 1)
+	}
+	cc.stopIdleTimer()
+	cc.tcpConn.Close()
+	cc.reliSend.Close()
+	cc.reliRecv.Close()
+}
+
+func genBootEpoch() uint32 {
+	return genClientID()
 }
 
 func genClientID() uint32 {
