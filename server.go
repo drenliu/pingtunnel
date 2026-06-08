@@ -31,6 +31,9 @@ type Server struct {
 	dnsQName    string
 	dnsUpstream string // non-tunnel QNAME queries are forwarded here when set
 
+	dnsRouteUDPSize   map[string]uint16 // routeKey -> client EDNS UDP payload size
+	dnsRouteUDPSizeMu sync.Mutex
+
 	// socksDynamic: when true, accept CmdSocksDial / CmdSocksRegister from clients.
 	socksDynamic bool
 
@@ -104,6 +107,7 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dn
 		dnsAddr:           da,
 		dnsQName:          qn,
 		dnsUpstream:       strings.TrimSpace(dnsUpstream),
+		dnsRouteUDPSize:   make(map[string]uint16),
 		sendQueues:        make(map[string]chan *TunnelPacket),
 		ruleTunnelClients: make(map[string]*ruleTunnelState),
 		listenersTCP:      make(map[string]net.Listener),
@@ -153,6 +157,9 @@ func (s *Server) Close() {
 	s.ruleTunnelMu.Lock()
 	s.ruleTunnelClients = make(map[string]*ruleTunnelState)
 	s.ruleTunnelMu.Unlock()
+	s.dnsRouteUDPSizeMu.Lock()
+	s.dnsRouteUDPSize = make(map[string]uint16)
+	s.dnsRouteUDPSizeMu.Unlock()
 }
 
 func (s *Server) Run() error {
@@ -336,6 +343,15 @@ func (s *Server) dnsReadLoop(c net.PacketConn) {
 		atomic.AddUint64(&s.stats.tunIn, 1)
 		clientKeyHash := pkt.KeyHash
 		clientID := pkt.ClientID
+		routeKey := s.queueKeyForAddr(clientKeyHash, clientID, addr)
+		udpSize := extractEDNSUDPSize(m)
+		if udpSize == 0 {
+			udpSize = s.dnsUDPSizeForRoute(routeKey)
+		}
+		if udpSize == 0 {
+			udpSize = dnsUDPSizeDefault
+		}
+		s.setDNSRouteUDPSize(routeKey, udpSize)
 		s.handlePacket(pkt, addr)
 		s.noteRuleTunnelICMP(clientKeyHash, clientID, addr)
 		resp := s.dequeueForAddr(clientKeyHash, clientID, addr)
@@ -346,7 +362,7 @@ func (s *Server) dnsReadLoop(c net.PacketConn) {
 		if err != nil {
 			continue
 		}
-		dnsOut, err := buildDNSResponse(m, respData)
+		dnsOut, err := buildDNSResponseWithSize(m, respData, udpSize)
 		if err != nil {
 			log.Printf("[server] DNS response: %v", err)
 			continue
@@ -626,6 +642,7 @@ func (s *Server) RestartListenersAfterKeyHashChange(prevKeyHash [16]byte, keyID 
 		}
 	}
 	s.sendQueuesMu.Unlock()
+	s.clearDNSRouteUDPSizePrefix(prefix)
 
 	s.ruleTunnelMu.Lock()
 	for k := range s.ruleTunnelClients {
@@ -945,7 +962,15 @@ func (s *Server) waitReady(sc *ServerConn) {
 
 func (s *Server) readTCP(sc *ServerConn) {
 	defer s.closeConn(sc)
-	buf := make([]byte, MaxPayloadSize)
+	chunk := MaxPayloadSize
+	if s.serveDNS {
+		udpSize := s.dnsUDPSizeForRoute(sc.routeKey)
+		if udpSize == 0 {
+			udpSize = dnsUDPSizeDefault
+		}
+		chunk = dnsMaxDataChunk(normQName(s.dnsQName), udpSize, true)
+	}
+	buf := make([]byte, chunk)
 	for atomic.LoadInt32(&sc.closed) == 0 {
 		n, err := sc.tcpConn.Read(buf)
 		if err != nil {
@@ -1194,6 +1219,39 @@ func (s *Server) dequeueRoute(routeKey string) *TunnelPacket {
 	default:
 		return &TunnelPacket{Cmd: CmdPing}
 	}
+}
+
+func (s *Server) setDNSRouteUDPSize(routeKey string, udpSize uint16) {
+	if routeKey == "" {
+		return
+	}
+	udpSize = clampDNSUDPSize(udpSize)
+	s.dnsRouteUDPSizeMu.Lock()
+	s.dnsRouteUDPSize[routeKey] = udpSize
+	s.dnsRouteUDPSizeMu.Unlock()
+}
+
+func (s *Server) dnsUDPSizeForRoute(routeKey string) uint16 {
+	if routeKey == "" {
+		return 0
+	}
+	s.dnsRouteUDPSizeMu.Lock()
+	sz := s.dnsRouteUDPSize[routeKey]
+	s.dnsRouteUDPSizeMu.Unlock()
+	return sz
+}
+
+func (s *Server) clearDNSRouteUDPSizePrefix(prefix string) {
+	if prefix == "" {
+		return
+	}
+	s.dnsRouteUDPSizeMu.Lock()
+	for k := range s.dnsRouteUDPSize {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.dnsRouteUDPSize, k)
+		}
+	}
+	s.dnsRouteUDPSizeMu.Unlock()
 }
 
 func (s *Server) queueKeyForAddr(keyHash [16]byte, clientID uint32, addr net.Addr) string {

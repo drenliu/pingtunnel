@@ -133,6 +133,73 @@ func TestDNSRequestResponseTunnelRoundtrip(t *testing.T) {
 	}
 }
 
+func TestMaxTunnelPayloadForDNSRequest(t *testing.T) {
+	for _, udpSize := range []uint16{512, 1232, 4096} {
+		n := maxTunnelPayloadForDNSRequest("c.pingt.local", udpSize)
+		if n <= 0 {
+			t.Fatalf("udpSize=%d max payload=%d", udpSize, n)
+		}
+		pkt := &TunnelPacket{Magic: MagicRequest, Cmd: CmdData, Data: make([]byte, n)}
+		raw, err := pkt.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := buildDNSRequestWithSize(1, "c.pingt.local", raw, udpSize); err != nil {
+			t.Fatalf("udpSize=%d n=%d: %v", udpSize, n, err)
+		}
+		if n < MaxPayloadSize {
+			pkt.Data = make([]byte, n+1)
+			raw, _ = pkt.Encode()
+			if _, err := buildDNSRequestWithSize(1, "c.pingt.local", raw, udpSize); err == nil {
+				t.Fatalf("udpSize=%d expected error for n+1=%d", udpSize, n+1)
+			}
+		}
+	}
+}
+
+func TestMaxTunnelPayloadForDNSResponseSmallerThanRequest(t *testing.T) {
+	reqN := maxTunnelPayloadForDNSRequest("c.pingt.local", 512)
+	respN := maxTunnelPayloadForDNSResponse("c.pingt.local", 512)
+	if respN <= 0 || reqN <= 0 {
+		t.Fatalf("req=%d resp=%d", reqN, respN)
+	}
+	if respN >= reqN {
+		t.Fatalf("response limit %d should be smaller than request limit %d at udp 512", respN, reqN)
+	}
+	pkt := &TunnelPacket{Magic: MagicResponse, Cmd: CmdData, Data: make([]byte, respN)}
+	raw, err := pkt.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := templateDNSRequest("c.pingt.local")
+	if _, err := buildDNSResponseWithSize(req, raw, 512); err != nil {
+		t.Fatalf("respN=%d: %v", respN, err)
+	}
+}
+
+func TestExtractEDNSUDPSize(t *testing.T) {
+	wire, err := buildDNSRequestWithSize(9, "c.pingt.local", []byte("x"), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := new(dns.Msg)
+	if err := m.Unpack(wire); err != nil {
+		t.Fatal(err)
+	}
+	if got := extractEDNSUDPSize(m); got != 1024 {
+		t.Fatalf("got %d want 1024", got)
+	}
+}
+
+func TestNextSmallerDNSUDPSize(t *testing.T) {
+	if got := nextSmallerDNSUDPSize(4096); got != 2048 {
+		t.Fatalf("4096 -> %d", got)
+	}
+	if got := nextSmallerDNSUDPSize(256); got != 0 {
+		t.Fatalf("256 -> %d", got)
+	}
+}
+
 func TestParseDNSResponseRejectsQuery(t *testing.T) {
 	key := ComputeKeyHash("k")
 	p, _ := (&TunnelPacket{Magic: MagicRequest, KeyHash: key, Cmd: CmdPing}).Encode()

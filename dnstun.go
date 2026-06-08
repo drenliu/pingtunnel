@@ -17,6 +17,13 @@ const defaultDNSQName = "c.pingt.local"
 const defaultDNSUpstreamPort = "53"
 const dnsForwardTimeout = 5 * time.Second
 const ednsUDPPayload = 4096
+const dnsUDPSizeDefault = 1232
+const dnsUDPSizeMin = 256
+const dnsUDPSizeMax = 4096
+const dnsProbeTimeout = 2 * time.Second
+
+// dnsUDPSizeLadder: probe from large to small; first success is the negotiated size.
+var dnsUDPSizeLadder = []uint16{4096, 2048, 1452, 1232, 1024, 768, 512, 400, 300, 256}
 
 // addUDPDefaultPort returns "host:port" suitable for net.ResolveUDPAddr, defaulting the port.
 func addUDPDefaultPort(hostport, defPort string) string {
@@ -41,10 +48,13 @@ func normQName(name string) string {
 
 // buildDNSRequest packs a single DNS query (type A) with EDNS0 tunnel payload in OPT.
 func buildDNSRequest(id uint16, qname string, payload []byte) ([]byte, error) {
+	return buildDNSRequestWithSize(id, qname, payload, dnsUDPSizeMax)
+}
+
+// buildDNSRequestWithSize sets EDNS UDP payload size and ensures the wire message fits.
+func buildDNSRequestWithSize(id uint16, qname string, payload []byte, udpSize uint16) ([]byte, error) {
+	udpSize = clampDNSUDPSize(udpSize)
 	qn := normQName(qname)
-	if msgLenEstimate(len(payload), len(qn)) > ednsUDPPayload-256 {
-		return nil, fmt.Errorf("tunnel payload too large for DNS/UDP (try ICMP transport)")
-	}
 	m := new(dns.Msg)
 	m.Id = id
 	m.RecursionDesired = true
@@ -53,18 +63,32 @@ func buildDNSRequest(id uint16, qname string, payload []byte) ([]byte, error) {
 		Qtype:  dns.TypeA,
 		Qclass: dns.ClassINET,
 	}}
-	attachTunnelOPT(m, payload)
-	return m.Pack()
+	attachTunnelOPT(m, payload, udpSize)
+	wire, err := m.Pack()
+	if err != nil {
+		return nil, err
+	}
+	if len(wire) > int(udpSize) {
+		return nil, fmt.Errorf("DNS wire %d exceeds UDP payload size %d", len(wire), udpSize)
+	}
+	return wire, nil
 }
 
 // buildDNSResponse builds a DNS response matching the request with tunnel payload in OPT.
 func buildDNSResponse(req *dns.Msg, payload []byte) ([]byte, error) {
+	udpSize := extractEDNSUDPSize(req)
+	if udpSize == 0 {
+		udpSize = dnsUDPSizeDefault
+	}
+	return buildDNSResponseWithSize(req, payload, udpSize)
+}
+
+// buildDNSResponseWithSize caps the response to the negotiated EDNS UDP payload size.
+func buildDNSResponseWithSize(req *dns.Msg, payload []byte, udpSize uint16) ([]byte, error) {
 	if len(req.Question) < 1 {
 		return nil, fmt.Errorf("no question")
 	}
-	if msgLenEstimate(len(payload), len(req.Question[0].Name)) > ednsUDPPayload-256 {
-		return nil, fmt.Errorf("response too large for DNS/UDP")
-	}
+	udpSize = clampDNSUDPSize(udpSize)
 	resp := new(dns.Msg)
 	resp.SetReply(req)
 	a := new(dns.A)
@@ -76,20 +100,121 @@ func buildDNSResponse(req *dns.Msg, payload []byte) ([]byte, error) {
 	}
 	a.A = net.IPv4(0, 0, 0, 0)
 	resp.Answer = []dns.RR{a}
-	attachTunnelOPT(resp, payload)
-	return resp.Pack()
+	attachTunnelOPT(resp, payload, udpSize)
+	wire, err := resp.Pack()
+	if err != nil {
+		return nil, err
+	}
+	if len(wire) > int(udpSize) {
+		return nil, fmt.Errorf("DNS wire %d exceeds UDP payload size %d", len(wire), udpSize)
+	}
+	return wire, nil
 }
 
-func attachTunnelOPT(m *dns.Msg, payload []byte) {
+func attachTunnelOPT(m *dns.Msg, payload []byte, udpSize uint16) {
+	udpSize = clampDNSUDPSize(udpSize)
 	opt := new(dns.OPT)
 	opt.Hdr.Name = "."
 	opt.Hdr.Rrtype = dns.TypeOPT
-	opt.SetUDPSize(ednsUDPPayload)
+	opt.SetUDPSize(udpSize)
 	loc := new(dns.EDNS0_LOCAL)
 	loc.Code = ednsLocalTunnel
 	loc.Data = append([]byte(nil), payload...)
 	opt.Option = []dns.EDNS0{loc}
 	m.Extra = []dns.RR{opt}
+}
+
+func clampDNSUDPSize(udpSize uint16) uint16 {
+	if udpSize < dnsUDPSizeMin {
+		return dnsUDPSizeMin
+	}
+	if udpSize > dnsUDPSizeMax {
+		return dnsUDPSizeMax
+	}
+	return udpSize
+}
+
+func extractEDNSUDPSize(m *dns.Msg) uint16 {
+	for _, ex := range m.Extra {
+		if opt, ok := ex.(*dns.OPT); ok {
+			return opt.UDPSize()
+		}
+	}
+	return 0
+}
+
+func templateDNSRequest(qname string) *dns.Msg {
+	m := new(dns.Msg)
+	m.Id = 1
+	m.Question = []dns.Question{{
+		Name:   normQName(qname),
+		Qtype:  dns.TypeA,
+		Qclass: dns.ClassINET,
+	}}
+	return m
+}
+
+// maxTunnelPayloadForDNSRequest returns the largest CmdData payload in a DNS query.
+func maxTunnelPayloadForDNSRequest(qname string, udpSize uint16) int {
+	udpSize = clampDNSUDPSize(udpSize)
+	qn := normQName(qname)
+	lo, hi := 0, MaxPayloadSize
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		pkt := &TunnelPacket{Magic: MagicRequest, Cmd: CmdData, Data: make([]byte, mid)}
+		raw, err := pkt.Encode()
+		if err != nil {
+			hi = mid - 1
+			continue
+		}
+		if _, err := buildDNSRequestWithSize(1, qn, raw, udpSize); err == nil {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo
+}
+
+// maxTunnelPayloadForDNSResponse returns the largest CmdData payload in a DNS response.
+// Responses include an A answer RR and are larger than requests for the same tunnel frame.
+func maxTunnelPayloadForDNSResponse(qname string, udpSize uint16) int {
+	udpSize = clampDNSUDPSize(udpSize)
+	req := templateDNSRequest(qname)
+	lo, hi := 0, MaxPayloadSize
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		pkt := &TunnelPacket{Magic: MagicResponse, Cmd: CmdData, Data: make([]byte, mid)}
+		raw, err := pkt.Encode()
+		if err != nil {
+			hi = mid - 1
+			continue
+		}
+		if _, err := buildDNSResponseWithSize(req, raw, udpSize); err == nil {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo
+}
+
+// dnsMaxDataChunk is the largest CmdData payload per DNS frame.
+// forResponse: true when data is sent in DNS responses (server → client).
+func dnsMaxDataChunk(qname string, udpSize uint16, forResponse bool) int {
+	var chunk int
+	if forResponse {
+		chunk = maxTunnelPayloadForDNSResponse(qname, udpSize)
+	} else {
+		chunk = maxTunnelPayloadForDNSRequest(qname, udpSize)
+	}
+	if chunk < 64 {
+		return 64
+	}
+	if chunk > MaxPayloadSize {
+		return MaxPayloadSize
+	}
+	return chunk
 }
 
 func extractEDNSTunnelPayload(m *dns.Msg) []byte {
@@ -125,10 +250,19 @@ func qnamesMatch(serverExpect, fromPacket string) bool {
 	return normQName(serverExpect) == normQName(fromPacket)
 }
 
-// rough upper bound on wire size for conservative checks
-func msgLenEstimate(tunnelLen, nameLen int) int {
-	// 12 + question ~ name+4 + 300 for OPT+EDNS+labels
-	return 12 + nameLen + 4 + 16 + tunnelLen
+// nextSmallerDNSUDPSize returns the next step down on the probe ladder, or 0 if at minimum.
+func nextSmallerDNSUDPSize(cur uint16) uint16 {
+	for i, sz := range dnsUDPSizeLadder {
+		if sz == cur && i+1 < len(dnsUDPSizeLadder) {
+			return dnsUDPSizeLadder[i+1]
+		}
+	}
+	for _, sz := range dnsUDPSizeLadder {
+		if sz < cur {
+			return sz
+		}
+	}
+	return 0
 }
 
 // parseServerTransports maps -transport (server) to (serveICMP, serveDNS).

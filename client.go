@@ -45,12 +45,13 @@ type Client struct {
 	socksMu       sync.Mutex
 	nextSocksConn uint32
 
-	tunSeq    uint32
-	mu        sync.RWMutex
-	closed    int32
-	done      chan struct{}
-	setupDone chan struct{}
-	setupFail chan struct{}
+	tunSeq     uint32
+	dnsUDPSize uint32 // atomic: negotiated EDNS UDP payload size (DNS transport)
+	mu         sync.RWMutex
+	closed     int32
+	done       chan struct{}
+	setupDone  chan struct{}
+	setupFail  chan struct{}
 }
 
 type ClientConn struct {
@@ -148,6 +149,10 @@ func (c *Client) Run() error {
 		defer conn.Close()
 	}
 
+	if c.transport == "dns" {
+		atomic.StoreUint32(&c.dnsUDPSize, uint32(dnsUDPSizeLadder[0]))
+		c.probeDNSPayloadSize()
+	}
 	go c.receiver()
 	go c.sender()
 	if c.wantPortForward() {
@@ -271,7 +276,14 @@ func (c *Client) sender() {
 		seq := atomic.AddUint32(&c.tunSeq, 1)
 		if c.transport == "dns" {
 			id := uint16(seq)
-			dnsWire, e := buildDNSRequest(id, qn, payload)
+			udpSize := c.dnsUDPSizeVal()
+			dnsWire, e := buildDNSRequestWithSize(id, qn, payload, udpSize)
+			if e != nil {
+				if c.shrinkDNSUDPSize() {
+					udpSize = c.dnsUDPSizeVal()
+					dnsWire, e = buildDNSRequestWithSize(id, qn, payload, udpSize)
+				}
+			}
 			if e != nil {
 				log.Printf("[client] DNS request pack: %v", e)
 				continue
@@ -471,7 +483,11 @@ func (c *Client) readTarget(cc *ClientConn) {
 		log.Printf("[client] conn %d: target closed", cc.id)
 	}()
 
-	buf := make([]byte, MaxPayloadSize)
+	chunk := MaxPayloadSize
+	if c.transport == "dns" {
+		chunk = c.dnsMaxDataChunk()
+	}
+	buf := make([]byte, chunk)
 	for {
 		n, err := cc.tcpConn.Read(buf)
 		if err != nil {
@@ -593,6 +609,102 @@ func (c *Client) enqueue(pkt *TunnelPacket) {
 	case c.sendQueue <- pkt:
 	default:
 		log.Println("[client] send queue full, dropping")
+	}
+}
+
+func (c *Client) dnsUDPSizeVal() uint16 {
+	v := atomic.LoadUint32(&c.dnsUDPSize)
+	if v == 0 {
+		return dnsUDPSizeDefault
+	}
+	return clampDNSUDPSize(uint16(v))
+}
+
+func (c *Client) dnsMaxDataChunk() int {
+	qn := c.dnsQName
+	if strings.TrimSpace(qn) == "" {
+		qn = defaultDNSQName
+	}
+	return dnsMaxDataChunk(normQName(qn), c.dnsUDPSizeVal(), false)
+}
+
+func (c *Client) shrinkDNSUDPSize() bool {
+	cur := c.dnsUDPSizeVal()
+	next := nextSmallerDNSUDPSize(cur)
+	if next == 0 || next == cur {
+		return false
+	}
+	atomic.StoreUint32(&c.dnsUDPSize, uint32(next))
+	log.Printf("[client] DNS UDP payload size reduced to %d", next)
+	return true
+}
+
+func (c *Client) probeDNSPayloadSize() {
+	qn := c.dnsQName
+	if strings.TrimSpace(qn) == "" {
+		qn = defaultDNSQName
+	}
+	qn = normQName(qn)
+
+	for _, udpSize := range dnsUDPSizeLadder {
+		if c.dnsProbeRoundTrip(qn, udpSize) {
+			atomic.StoreUint32(&c.dnsUDPSize, uint32(udpSize))
+			log.Printf("[client] DNS UDP payload size negotiated: %d (data chunk %d)",
+				udpSize, dnsMaxDataChunk(qn, udpSize, false))
+			_ = c.tunConn.SetReadDeadline(time.Time{})
+			return
+		}
+	}
+	atomic.StoreUint32(&c.dnsUDPSize, uint32(dnsUDPSizeMin))
+	log.Printf("[client] DNS UDP payload size defaulted to %d", dnsUDPSizeMin)
+	_ = c.tunConn.SetReadDeadline(time.Time{})
+}
+
+func (c *Client) dnsProbeRoundTrip(qname string, udpSize uint16) bool {
+	if c.tunConn == nil || c.tunPeer == nil {
+		return false
+	}
+	dataLen := maxTunnelPayloadForDNSRequest(qname, udpSize)
+	pkt := &TunnelPacket{
+		Magic:    MagicRequest,
+		KeyHash:  c.key,
+		ClientID: c.clientID,
+		Cmd:      CmdPing,
+	}
+	if dataLen > 0 {
+		pkt.Data = make([]byte, dataLen)
+	}
+	raw, err := pkt.Encode()
+	if err != nil {
+		return false
+	}
+	const probeID = 0x7e7e
+	wire, err := buildDNSRequestWithSize(probeID, qname, raw, udpSize)
+	if err != nil {
+		return false
+	}
+	_ = c.tunConn.SetReadDeadline(time.Now().Add(dnsProbeTimeout))
+	if _, err := c.tunConn.WriteTo(wire, c.tunPeer); err != nil {
+		return false
+	}
+	buf := make([]byte, 65535)
+	for {
+		n, _, err := c.tunConn.ReadFrom(buf)
+		if err != nil {
+			return false
+		}
+		if n < 12 {
+			continue
+		}
+		id, payload, err := parseDNSResponse(buf[:n])
+		if err != nil || id != probeID {
+			continue
+		}
+		dec, err := DecodeTunnelPacket(payload)
+		if err != nil || dec.Magic != MagicResponse || dec.KeyHash != c.key || dec.ClientID != c.clientID {
+			continue
+		}
+		return true
 	}
 }
 
