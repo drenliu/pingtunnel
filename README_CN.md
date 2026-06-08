@@ -15,7 +15,9 @@
 - **流量统计** — 实时网速、历史流量汇总，按密钥分组统计
 - **连接监控** — 实时显示活跃 TCP/UDP 会话及其客户端地址
 - **配置持久化** — 密钥、规则、流量数据自动保存到 `pingtunnel.json`
-- **自动恢复** — 服务器重启后自动根据配置文件恢复端口监听
+- **自动恢复** — 服务端重启后从配置恢复监听端口；客户端周期性重注册，隧道路由无需重启客户端即可恢复（ICMP 与 DNS 均支持）
+- **DNS 透明代理** — 可选上游 DNS 转发：非 `-dns-name` 的查询转发到 `-dns-upstream`（适合监听 `:53` 时同时提供正常解析）
+- **多客户端隔离** — 每个客户端实例有唯一 `clientID`；相同密钥、相同源 IP 的多个客户端互不串线
 - **SOCKS5 动态转发** — 可选本地 SOCKS5 代理（类似 `ssh -D`）；服务端通过 `-socks-dynamic` 控制是否允许
 
 ## 编译
@@ -49,6 +51,13 @@ sudo ./pingtunnel -type server -key <管理密码>
 ./pingtunnel -type server -key <管理密码> -transport dns -dns-addr :1053 -dns-name c.pingt.local
 ```
 
+**DNS + 透明代理**（监听 `:53`，隧道走 `c.pingt.local`，其他域名转发到上游 DNS）：
+
+```bash
+sudo ./pingtunnel -type server -key <管理密码> -transport dns \
+  -dns-addr :53 -dns-name c.pingt.local -dns-upstream 8.8.8.8
+```
+
 参数说明：
 
 | 参数 | 说明 | 默认值 |
@@ -58,7 +67,8 @@ sudo ./pingtunnel -type server -key <管理密码>
 | `-web-server-ip` | Web 界面里复制出的客户端命令中 `-s` 的默认值（可选；见下文 **Web 界面**） | 空 |
 | `-transport` | `both`（默认）同时开 ICMP+DNS，或只开 `icmp` / `dns` | `both` |
 | `-dns-addr` | 含 DNS 时的 UDP 监听，如 `:1053` | `:1053` |
-| `-dns-name` | 含 DNS 时 QNAME，与走 DNS 的客户端一致 | `c.pingt.local` |
+| `-dns-name` | DNS 隧道 QNAME，与走 DNS 的客户端一致 | `c.pingt.local` |
+| `-dns-upstream` | 非隧道域名的上游 DNS（在 `-dns-addr` 上做透明代理） | 空 |
 | `-socks-dynamic` | 允许客户端使用 `-socks`（经隧道的 SOCKS5 动态转发） | 关闭 |
 
 启动后打开浏览器访问 `http://<服务器IP>:8080`，使用 `admin` / `<管理密码>` 登录。
@@ -71,6 +81,7 @@ sudo ./pingtunnel -type server -key <管理密码>
 - **Target Address** — 客户端需要转发到的目标地址（如 `192.168.33.1:22`）
 - **Protocol** — `TCP`（默认）或 `UDP`；同一监听端口可同时配置 TCP 与 UDP 两条独立规则
 - **修改** — 每条密钥旁的「修改」可更新别名和/或隧道密钥。修改密钥会改变哈希，服务端仅重启该密钥相关规则的端口监听，客户端需改用新的 `-key` 重连。
+- **修改规则** — 每条规则旁的「修改规则」可更新监听地址、目标地址和协议；服务端会自动重绑受影响监听。
 
 **Web 界面里客户端命令中的 `-s`：**
 
@@ -162,6 +173,32 @@ sudo ./pingtunnel -type client -s 120.120.120.120 -key office-ssh -socks :1080
 ```bash
 curl --socks5 127.0.0.1:1080 https://example.com
 ```
+
+### 场景：DNS 传输 + 透明代理
+
+适用于服务端可监听 UDP `:53`，且希望在同一端口上同时提供正常 DNS 解析与隧道。
+
+**1. 服务端**
+
+```bash
+sudo ./pingtunnel -type server -key admin123 -transport dns \
+  -dns-addr :53 -dns-name c.pingt.local -dns-upstream 8.8.8.8
+```
+
+**2. 客户端**（DNS 传输通常不需要 root）
+
+```bash
+./pingtunnel -type client -transport dns -s 120.120.120.120:53 \
+  -l :4455 -t 192.168.33.1:22 -key office-ssh -dns-name c.pingt.local
+```
+
+**3. 将 DNS 指向服务端**
+
+把机器的 DNS 设为 `120.120.120.120`。普通域名（如 `example.com`）经 `-dns-upstream` 解析；pingtunnel 客户端仍通过 `c.pingt.local` 走隧道。
+
+### 服务端重启恢复
+
+重启后服务端从 `pingtunnel.json` 重新加载并恢复监听端口。内存中的隧道客户端路由由客户端周期性重发 `CmdSetup`（首次握手成功后约每 20 秒）重建。**需同时更新服务端与客户端二进制**。服务端重启后无需重启客户端，等待约 20 秒内路由即可恢复。
 
 ## 项目结构
 

@@ -15,7 +15,9 @@ TCP and UDP port forwarding over the **ICMP (Ping) protocol** or, alternatively,
 - **Traffic Statistics** — Real-time speed and historical traffic totals, grouped by key
 - **Connection Monitoring** — Live view of active TCP connections with client IPs
 - **Persistent Config** — Keys, rules, and traffic data saved to `pingtunnel.json`
-- **Auto Recovery** — Server automatically restores port listeners from config on restart
+- **Auto Recovery** — Server restores port listeners from config on restart; clients periodically re-register so tunnel routes recover without a client restart (ICMP and DNS)
+- **DNS Transparent Proxy** — Optional upstream DNS relay: queries for names other than `-dns-name` are forwarded to `-dns-upstream` (useful when binding `:53`)
+- **Multi-Client Isolation** — Each client instance has a unique `clientID`; multiple clients with the same key and source IP are routed independently
 - **SOCKS5 Dynamic Forwarding** — Optional local SOCKS5 proxy (`ssh -D` style); server can enable or disable it with `-socks-dynamic`
 
 ## Build
@@ -55,6 +57,13 @@ sudo ./pingtunnel -type server -key <admin_password>
 ./pingtunnel -type server -key <admin_password> -transport dns -dns-addr :1053 -dns-name c.pingt.local
 ```
 
+**DNS + transparent proxy** (listen on `:53`, tunnel on `c.pingt.local`, relay other names to upstream DNS):
+
+```bash
+sudo ./pingtunnel -type server -key <admin_password> -transport dns \
+  -dns-addr :53 -dns-name c.pingt.local -dns-upstream 8.8.8.8
+```
+
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-key` | Web admin login password (username is `admin`) | Required |
@@ -62,7 +71,8 @@ sudo ./pingtunnel -type server -key <admin_password>
 | `-web-server-ip` | Default `-s` host in Web UI copy-paste client commands (optional; see **Web UI** below) | *(empty)* |
 | `-transport` | `both` (default): ICMP and DNS. Or `icmp` or `dns` only | `both` |
 | `-dns-addr` | UDP port for the DNS part (when `both` or `dns`) | `:1053` |
-| `-dns-name` | QNAME for DNS; must match **DNS** clients’ `-dns-name` | `c.pingt.local` |
+| `-dns-name` | QNAME for DNS tunnel; must match **DNS** clients’ `-dns-name` | `c.pingt.local` |
+| `-dns-upstream` | Upstream DNS for non-tunnel queries (transparent proxy on `-dns-addr`) | *(empty)* |
 | `-socks-dynamic` | Allow clients to use `-socks` (SOCKS5 dynamic forwarding over the tunnel) | off |
 
 After starting, open `http://<server_ip>:8080` in your browser and log in with `admin` / `<admin_password>`.
@@ -75,6 +85,7 @@ Use the Web UI to add tunnel keys and forwarding rules:
 - **Target Address** — Destination the client forwards traffic to (e.g. `192.168.33.1:22`)
 - **Protocol** — `TCP` (default) or `UDP`; TCP and UDP may use the same listen port as separate rules
 - **Edit** — Per-key **Edit** updates alias and/or tunnel key. Changing the secret changes the key hash; the server restarts port-forward listeners for that key’s rules only (existing clients must use the new `-key`).
+- **Edit Rule** — Per-rule **Edit Rule** updates listen address, target address, and protocol; the server rebinds affected listeners automatically.
 
 **Client command templates (`-s` in the copied command):**
 
@@ -164,6 +175,32 @@ sudo ./pingtunnel -type client -s 120.120.120.120 -key office-ssh -socks :1080
 ```bash
 curl --socks5 127.0.0.1:1080 https://example.com
 ```
+
+### Scenario: DNS transport with transparent proxy
+
+Use this when the server can listen on UDP `:53` and you want normal DNS resolution plus the tunnel on the same port.
+
+**1. Server**
+
+```bash
+sudo ./pingtunnel -type server -key admin123 -transport dns \
+  -dns-addr :53 -dns-name c.pingt.local -dns-upstream 8.8.8.8
+```
+
+**2. Client** (no root required for DNS transport)
+
+```bash
+./pingtunnel -type client -transport dns -s 120.120.120.120:53 \
+  -l :4455 -t 192.168.33.1:22 -key office-ssh -dns-name c.pingt.local
+```
+
+**3. Point DNS resolvers at the server**
+
+Set a machine’s DNS to `120.120.120.120`. Ordinary lookups (e.g. `example.com`) go to `8.8.8.8` via `-dns-upstream`. The pingtunnel client still uses `c.pingt.local` for tunnel traffic.
+
+### Server restart recovery
+
+On restart, the server reloads `pingtunnel.json` and reopens configured listen ports. In-memory tunnel client routes are rebuilt when clients re-send `CmdSetup` (every ~20 seconds after the initial handshake). **Update both server and client binaries** for this behavior. No client restart is required after a server restart; allow up to ~20 seconds for routes to recover.
 
 ## Project Structure
 
