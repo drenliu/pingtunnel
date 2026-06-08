@@ -15,6 +15,10 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
+// Re-send setup periodically so the server can rebuild in-memory tunnel routes
+// after restart (ICMP and DNS transports).
+const tunnelSetupRefreshInterval = 20 * time.Second
+
 type Client struct {
 	listenAddr string
 	serverAddr string
@@ -188,30 +192,46 @@ func (c *Client) sendSetup() {
 		return
 	}
 	data := fmt.Sprintf("%s|%s|%s", c.listenAddr, c.targetAddr, c.protocol)
-	for i := 0; i < 30; i++ {
-		select {
-		case <-c.setupDone:
-			return
-		case <-c.done:
-			return
-		default:
-		}
-		c.enqueue(&TunnelPacket{Cmd: CmdSetup, Data: []byte(data)})
-		time.Sleep(time.Second)
-	}
+	c.sendPeriodicCmd(CmdSetup, []byte(data), tunnelSetupRefreshInterval)
 }
 
 func (c *Client) sendSocksRegister() {
-	for i := 0; i < 30; i++ {
+	c.sendPeriodicCmd(CmdSocksRegister, nil, tunnelSetupRefreshInterval)
+}
+
+func (c *Client) sendPeriodicCmd(cmd uint8, data []byte, refreshInterval time.Duration) {
+	send := func() {
+		pkt := &TunnelPacket{Cmd: cmd}
+		if len(data) > 0 {
+			pkt.Data = append([]byte(nil), data...)
+		}
+		c.enqueue(pkt)
+	}
+	send()
+	// Retry quickly until the server acknowledges setup.
+	for {
 		select {
-		case <-c.setupDone:
-			return
 		case <-c.done:
 			return
-		default:
+		case <-c.setupDone:
+			goto refresh
+		case <-c.setupFail:
+			return
+		case <-time.After(time.Second):
+			send()
 		}
-		c.enqueue(&TunnelPacket{Cmd: CmdSocksRegister})
-		time.Sleep(time.Second)
+	}
+refresh:
+	// Keep re-registering so the server can recover routes after restart.
+	ticker := time.NewTicker(refreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			send()
+		}
 	}
 }
 

@@ -24,6 +24,7 @@ func main() {
 	transport := flag.String("transport", "", "server: both|icmp|dns (default both). client: icmp|dns (default icmp).")
 	dnsAddr := flag.String("dns-addr", ":1053", "server: UDP listen (DNS mode only, e.g. :1053)")
 	dnsName := flag.String("dns-name", "c.pingt.local", "QNAME in DNS mode; must match on server and client")
+	dnsUpstream := flag.String("dns-upstream", "", "server: upstream DNS for non-tunnel queries (e.g. 8.8.8.8 or 192.168.1.1:53)")
 
 	flag.Parse()
 
@@ -42,6 +43,7 @@ func main() {
 		fmt.Println("  -transport  both (default) = ICMP + DNS. Or icmp only, dns only.")
 		fmt.Println("  -dns-addr  UDP listen for DNS part (default :1053; used with both or dns)")
 		fmt.Println("  -dns-name  QNAME in DNS (default c.pingt.local)")
+		fmt.Println("  -dns-upstream  Upstream DNS for other names (transparent proxy on -dns-addr)")
 		fmt.Println()
 		fmt.Println("Client options:")
 		fmt.Println("  -l      Local listen address")
@@ -54,7 +56,7 @@ func main() {
 		fmt.Println()
 		fmt.Println("Examples:")
 		fmt.Println("  sudo pingtunnel -type server -key 123456")
-		fmt.Println("  ./pingtunnel -type server -transport dns -key 123456 -dns-addr :1053   # DNS only")
+		fmt.Println("  ./pingtunnel -type server -transport dns -key 123456 -dns-addr :53 -dns-upstream 8.8.8.8")
 		fmt.Println("  sudo pingtunnel -type client -l :4455 -s 120.46.204.235 -t 192.168.33.1:22 -key mykey")
 		fmt.Println("  ./pingtunnel -type client -transport dns -s 120.46.204.235:1053 -l :4455 -t 192.168.33.1:22 -key mykey")
 		fmt.Println()
@@ -87,7 +89,7 @@ func main() {
 		default:
 			log.Fatalf("server: -transport must be both, icmp, or dns, got %q", *transport)
 		}
-		srv := NewServer(mgr, *socksDynamic, srvT, *dnsAddr, *dnsName)
+		srv := NewServer(mgr, *socksDynamic, srvT, *dnsAddr, *dnsName, *dnsUpstream)
 		StartWeb(*webAddr, *key, mgr, srv, *webServerIP)
 
 		go func() {

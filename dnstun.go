@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -13,6 +14,8 @@ const ednsLocalTunnel = 0x7e01
 
 const defaultDNSPort = "1053"
 const defaultDNSQName = "c.pingt.local"
+const defaultDNSUpstreamPort = "53"
+const dnsForwardTimeout = 5 * time.Second
 const ednsUDPPayload = 4096
 
 // addUDPDefaultPort returns "host:port" suitable for net.ResolveUDPAddr, defaulting the port.
@@ -161,6 +164,34 @@ func finalizeDNSServerAddr(serveDNS bool, dnsAddr, dnsName string) (addr, name s
 		name = defaultDNSQName
 	}
 	return addr, name
+}
+
+// forwardDNSQuery relays a raw DNS request to upstream and writes the response back to clientAddr.
+func forwardDNSQuery(upstream string, c net.PacketConn, req []byte, clientAddr net.Addr) {
+	upstream = strings.TrimSpace(upstream)
+	if upstream == "" || c == nil || len(req) < 12 || clientAddr == nil {
+		return
+	}
+	target := addUDPDefaultPort(upstream, defaultDNSUpstreamPort)
+	uaddr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		return
+	}
+	conn, err := net.DialUDP("udp", nil, uaddr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(dnsForwardTimeout))
+	if _, err := conn.Write(req); err != nil {
+		return
+	}
+	resp := make([]byte, 65535)
+	n, err := conn.Read(resp)
+	if err != nil || n < 12 {
+		return
+	}
+	_, _ = c.WriteTo(resp[:n], clientAddr)
 }
 
 func normalizeClientTransport(s string) string {

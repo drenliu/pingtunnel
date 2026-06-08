@@ -23,12 +23,13 @@ const icmpClientHeartbeatTTL = 45 * time.Second
 type Server struct {
 	manager *Manager
 	// At most one of these may be nil. Both may be set when the server uses ICMP+DNS.
-	tunICM    net.PacketConn
-	tunDNS    net.PacketConn
-	serveICMP bool
-	serveDNS  bool
-	dnsAddr   string
-	dnsQName  string
+	tunICM      net.PacketConn
+	tunDNS      net.PacketConn
+	serveICMP   bool
+	serveDNS    bool
+	dnsAddr     string
+	dnsQName    string
+	dnsUpstream string // non-tunnel QNAME queries are forwarded here when set
 
 	// socksDynamic: when true, accept CmdSocksDial / CmdSocksRegister from clients.
 	socksDynamic bool
@@ -92,7 +93,7 @@ type ruleTunnelState struct {
 	lastSeen time.Time
 }
 
-func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName string) *Server {
+func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dnsUpstream string) *Server {
 	si, sd := parseServerTransports(transport)
 	da, qn := finalizeDNSServerAddr(sd, dnsAddr, dnsQName)
 	return &Server{
@@ -102,6 +103,7 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName str
 		serveDNS:          sd,
 		dnsAddr:           da,
 		dnsQName:          qn,
+		dnsUpstream:       strings.TrimSpace(dnsUpstream),
 		sendQueues:        make(map[string]chan *TunnelPacket),
 		ruleTunnelClients: make(map[string]*ruleTunnelState),
 		listenersTCP:      make(map[string]net.Listener),
@@ -203,6 +205,10 @@ func (s *Server) Run() error {
 	}
 	if udp != nil {
 		log.Printf("[server] listening on DNS/UDP %s (QNAME %s)", udp.LocalAddr().String(), normQName(s.dnsQName))
+		if s.dnsUpstream != "" {
+			log.Printf("[server] DNS transparent proxy: other names -> %s",
+				addUDPDefaultPort(s.dnsUpstream, defaultDNSUpstreamPort))
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -308,6 +314,11 @@ func (s *Server) dnsReadLoop(c net.PacketConn) {
 			continue
 		}
 		if !qnamesMatch(s.dnsQName, m.Question[0].Name) {
+			if s.dnsUpstream != "" {
+				reqCopy := make([]byte, n)
+				copy(reqCopy, buf[:n])
+				go forwardDNSQuery(s.dnsUpstream, c, reqCopy, addr)
+			}
 			continue
 		}
 		raw := extractEDNSTunnelPayload(m)
@@ -410,9 +421,12 @@ func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
 			go s.startTCPListener(listenAddr, targetAddr, pkt.KeyHash)
 		}
 	}
+	_, _, wasOnline := s.routeKeyForListener(pkt.KeyHash, mapKey)
 	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck})
 	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, mapKey, from)
-	log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s", listenAddr, targetAddr, protocol)
+	if !wasOnline {
+		log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s", listenAddr, targetAddr, protocol)
+	}
 }
 
 func (s *Server) handleConnectAck(pkt *TunnelPacket, from net.Addr) {
@@ -482,9 +496,12 @@ func (s *Server) handleSocksRegister(pkt *TunnelPacket, from net.Addr) {
 		s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSocksRegisterNack})
 		return
 	}
+	_, _, wasOnline := s.routeKeyForListener(pkt.KeyHash, "socks-dynamic")
 	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck})
 	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, "socks-dynamic", from)
-	log.Printf("[server] SOCKS dynamic forwarding registered for tunnel key")
+	if !wasOnline {
+		log.Printf("[server] SOCKS dynamic forwarding registered for tunnel key")
+	}
 }
 
 func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {
