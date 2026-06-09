@@ -127,6 +127,7 @@ func (s *Server) Close() {
 	if !atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
 		return
 	}
+	Audit("server.shutdown", map[string]string{"result": "ok"})
 	close(s.done)
 	if s.tunICM != nil {
 		s.tunICM.Close()
@@ -271,6 +272,7 @@ func (s *Server) icmpReadLoop(c net.PacketConn) {
 		}
 		if s.manager.ValidateKey(pkt.KeyHash) == nil {
 			atomic.AddUint64(&s.stats.badKey, 1)
+			s.auditInvalidTunnelKey("icmp", pkt.KeyHash, pkt.ClientID, addr)
 			continue
 		}
 		atomic.AddUint64(&s.stats.tunIn, 1)
@@ -343,6 +345,7 @@ func (s *Server) dnsReadLoop(c net.PacketConn) {
 		}
 		if s.manager.ValidateKey(pkt.KeyHash) == nil {
 			atomic.AddUint64(&s.stats.badKey, 1)
+			s.auditInvalidTunnelKey("dns", pkt.KeyHash, pkt.ClientID, addr)
 			continue
 		}
 		atomic.AddUint64(&s.stats.tunIn, 1)
@@ -413,15 +416,16 @@ func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
 
 	if !s.manager.IsRuleAllowed(pkt.KeyHash, listenAddr, targetAddr, protocol) {
 		kc := s.manager.ValidateKey(pkt.KeyHash)
-		keyInfo := "unknown"
-		if kc != nil {
-			if kc.Name != "" {
-				keyInfo = kc.Name + " (key=" + kc.Key + ")"
-			} else {
-				keyInfo = "key=" + kc.Key
-			}
-		}
-		log.Printf("[server] setup rejected: %s -> %s (%s) key=%s (not allowed)", listenAddr, targetAddr, protocol, keyInfo)
+		Audit("tunnel.setup.rejected", mergeFields(auditKeyFields(s.manager, pkt.KeyHash), map[string]string{
+			"listen_addr": listenAddr,
+			"target_addr": targetAddr,
+			"protocol":    protocol,
+			"client_addr": addrString(from),
+			"client_id":   fmt.Sprintf("%08x", pkt.ClientID),
+			"result":      "denied",
+			"detail":      "rule not allowed",
+		}))
+		log.Printf("[server] setup rejected: %s -> %s (%s) key=%s (not allowed)", listenAddr, targetAddr, protocol, keyAuditLabel(kc))
 		return
 	}
 
@@ -446,6 +450,14 @@ func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
 	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck, Data: s.setupAckPayload()})
 	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, mapKey, from)
 	if !wasOnline {
+		Audit("tunnel.client.online", mergeFields(auditKeyFields(s.manager, pkt.KeyHash), map[string]string{
+			"listen_addr": listenAddr,
+			"target_addr": targetAddr,
+			"protocol":    protocol,
+			"client_addr": addrString(from),
+			"client_id":   fmt.Sprintf("%08x", pkt.ClientID),
+			"result":      "ok",
+		}))
 		log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s", listenAddr, targetAddr, protocol)
 	}
 }
@@ -513,6 +525,12 @@ func (s *Server) handleClose(pkt *TunnelPacket, from net.Addr) {
 
 func (s *Server) handleSocksRegister(pkt *TunnelPacket, from net.Addr) {
 	if !s.socksDynamic {
+		Audit("socks.register.rejected", mergeFields(auditKeyFields(s.manager, pkt.KeyHash), map[string]string{
+			"client_addr": addrString(from),
+			"client_id":   fmt.Sprintf("%08x", pkt.ClientID),
+			"result":      "denied",
+			"detail":      "socks-dynamic disabled",
+		}))
 		log.Printf("[server] SOCKS register rejected (socks-dynamic disabled)")
 		s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSocksRegisterNack})
 		return
@@ -1298,6 +1316,20 @@ func (s *Server) matchRoute(sc *ServerConn, from net.Addr) bool {
 		return false
 	}
 	return sc.routeKey == s.queueKeyForAddr(sc.keyHash, sc.clientID, from)
+}
+
+func (s *Server) auditInvalidTunnelKey(transport string, hash [16]byte, clientID uint32, from net.Addr) {
+	AuditRateLimited(
+		transport+"|"+hashPrefix(hash)+"|"+addrString(from),
+		"tunnel.key.invalid",
+		mergeFields(auditKeyFields(s.manager, hash), map[string]string{
+			"transport":   transport,
+			"client_addr": addrString(from),
+			"client_id":   fmt.Sprintf("%08x", clientID),
+			"result":      "denied",
+		}),
+		10*time.Second,
+	)
 }
 
 func (sc *ServerConn) queueUDPFromUser(s *Server, data []byte) {

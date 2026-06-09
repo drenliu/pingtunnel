@@ -25,6 +25,7 @@ func main() {
 	dnsAddr := flag.String("dns-addr", ":1053", "server: UDP listen (DNS mode only, e.g. :1053)")
 	dnsName := flag.String("dns-name", "c.pingt.local", "QNAME in DNS mode; must match on server and client")
 	dnsUpstream := flag.String("dns-upstream", "", "server: upstream DNS for non-tunnel queries (e.g. 8.8.8.8 or 192.168.1.1:53)")
+	auditLog := flag.String("audit-log", "pingtunnel-audit.jsonl", "server: audit JSONL file path (use off to disable)")
 
 	flag.Parse()
 
@@ -44,6 +45,7 @@ func main() {
 		fmt.Println("  -dns-addr  UDP listen for DNS part (default :1053; used with both or dns)")
 		fmt.Println("  -dns-name  QNAME in DNS (default c.pingt.local)")
 		fmt.Println("  -dns-upstream  Upstream DNS for other names (transparent proxy on -dns-addr)")
+		fmt.Println("  -audit-log  Audit JSONL file (default pingtunnel-audit.jsonl; off to disable)")
 		fmt.Println()
 		fmt.Println("Client options:")
 		fmt.Println("  -l      Local listen address")
@@ -75,9 +77,22 @@ func main() {
 			log.Fatal("server mode requires -key (web admin password, username: admin)")
 		}
 
+		if err := InitAudit(*auditLog); err != nil {
+			log.Printf("[main] audit log: %v (audit disabled)", err)
+		} else if auditEnabled {
+			log.Printf("[main] audit log: %s", strings.TrimSpace(*auditLog))
+		}
+
 		mgr := NewManager("pingtunnel.json")
 		if err := mgr.Load(); err != nil {
 			log.Printf("[main] config load: %v (starting fresh)", err)
+			Audit("config.load", map[string]string{"result": "error", "detail": err.Error()})
+		} else {
+			Audit("config.load", map[string]string{
+				"result":    "ok",
+				"path":      "pingtunnel.json",
+				"key_count": fmt.Sprintf("%d", len(mgr.GetKeys())),
+			})
 		}
 
 		srvT := strings.ToLower(strings.TrimSpace(*transport))
@@ -91,11 +106,18 @@ func main() {
 		}
 		srv := NewServer(mgr, *socksDynamic, srvT, *dnsAddr, *dnsName, *dnsUpstream)
 		StartWeb(*webAddr, *key, mgr, srv, *webServerIP)
+		Audit("process.start", map[string]string{
+			"role":      "server",
+			"transport": srvT,
+			"web":       *webAddr,
+		})
 
 		go func() {
 			<-sigCh
 			log.Println("shutting down ...")
+			Audit("process.shutdown", map[string]string{"role": "server"})
 			srv.Close()
+			CloseAudit()
 			os.Exit(0)
 		}()
 		if err := srv.Run(); err != nil {

@@ -3,6 +3,7 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -76,6 +77,11 @@ func (ws *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !ws.authenticated(r) {
+		Audit("web.auth.denied", map[string]string{
+			"actor_ip": remoteIP(r),
+			"method":   r.Method,
+			"path":     p,
+		})
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 		return
@@ -107,6 +113,11 @@ func (ws *webServer) apiLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Username != "admin" || req.Password != ws.password {
+		Audit("web.login.failure", map[string]string{
+			"actor_ip": remoteIP(r),
+			"username": req.Username,
+			"result":   "denied",
+		})
 		jsonErr(w, "invalid username or password", 401)
 		return
 	}
@@ -128,6 +139,11 @@ func (ws *webServer) apiLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		MaxAge:   86400,
+	})
+	Audit("web.login.success", map[string]string{
+		"actor_ip": remoteIP(r),
+		"username": "admin",
+		"result":   "ok",
 	})
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
@@ -252,6 +268,13 @@ func (ws *webServer) apiAddKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ws.srv.StartConfiguredListeners()
+	Audit("web.key.create", mergeFields(auditKeyFields(ws.mgr, kc.Hash), map[string]string{
+		"actor_ip":    remoteIP(r),
+		"listen_addr": req.ListenAddr,
+		"target_addr": req.TargetAddr,
+		"protocol":    req.Protocol,
+		"result":      "ok",
+	}))
 	json.NewEncoder(w).Encode(kc)
 }
 
@@ -259,10 +282,19 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 	parts := strings.Split(rest, "/")
 
 	if len(parts) == 1 && r.Method == "DELETE" {
+		kc := ws.mgr.GetKeyByID(parts[0])
 		if err := ws.mgr.RemoveKey(parts[0]); err != nil {
 			jsonErr(w, err.Error(), 404)
 			return
 		}
+		fields := map[string]string{"actor_ip": remoteIP(r), "key_id": parts[0], "result": "ok"}
+		if kc != nil {
+			fields["key_hash"] = hashPrefix(kc.Hash)
+			if kc.Name != "" {
+				fields["key_name"] = kc.Name
+			}
+		}
+		Audit("web.key.delete", fields)
 		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 		return
 	}
@@ -290,6 +322,23 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 		} else {
 			ws.srv.StartConfiguredListeners()
 		}
+		kc := ws.mgr.GetKeyByID(parts[0])
+		fields := map[string]string{
+			"actor_ip":     remoteIP(r),
+			"key_id":       parts[0],
+			"hash_changed": fmt.Sprintf("%v", hashChanged),
+			"result":       "ok",
+		}
+		if kc != nil {
+			fields["key_hash"] = hashPrefix(kc.Hash)
+			if kc.Name != "" {
+				fields["key_name"] = kc.Name
+			}
+		}
+		if hashChanged {
+			fields["prev_key_hash"] = hashPrefix(prevHash)
+		}
+		Audit("web.key.update", fields)
 		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 		return
 	}
@@ -314,6 +363,20 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 			return
 		}
 		ws.srv.StartConfiguredListeners()
+		kc := ws.mgr.GetKeyByID(parts[0])
+		fields := map[string]string{
+			"actor_ip":    remoteIP(r),
+			"key_id":      parts[0],
+			"rule_id":     rule.ID,
+			"listen_addr": rule.ListenAddr,
+			"target_addr": rule.TargetAddr,
+			"protocol":    rule.Protocol,
+			"result":      "ok",
+		}
+		if kc != nil {
+			fields["key_hash"] = hashPrefix(kc.Hash)
+		}
+		Audit("web.rule.create", fields)
 		json.NewEncoder(w).Encode(rule)
 		return
 	}
@@ -323,6 +386,17 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 			jsonErr(w, err.Error(), 404)
 			return
 		}
+		kc := ws.mgr.GetKeyByID(parts[0])
+		fields := map[string]string{
+			"actor_ip": remoteIP(r),
+			"key_id":   parts[0],
+			"rule_id":  parts[2],
+			"result":   "ok",
+		}
+		if kc != nil {
+			fields["key_hash"] = hashPrefix(kc.Hash)
+		}
+		Audit("web.rule.delete", fields)
 		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 		return
 	}
@@ -356,6 +430,19 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 		} else {
 			ws.srv.StartConfiguredListeners()
 		}
+		fields := map[string]string{
+			"actor_ip":    remoteIP(r),
+			"key_id":      parts[0],
+			"rule_id":     rule.ID,
+			"listen_addr": rule.ListenAddr,
+			"target_addr": rule.TargetAddr,
+			"protocol":    rule.Protocol,
+			"result":      "ok",
+		}
+		if kc != nil {
+			fields["key_hash"] = hashPrefix(kc.Hash)
+		}
+		Audit("web.rule.update", fields)
 		json.NewEncoder(w).Encode(rule)
 		return
 	}
