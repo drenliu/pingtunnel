@@ -119,7 +119,20 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dn
 		connections:       make(map[uint32]*ServerConn),
 		done:              make(chan struct{}),
 		bootEpoch:         bootEpoch,
-		nextConnID:        bootEpoch, // avoid connID reuse across restarts (stale CmdClose)
+		nextConnID:        bootEpoch, // avoid connID reuse across restarts (stale CmdClose); kept < socksConnIDBase
+	}
+}
+
+// allocConnID returns a ConnID in [1, socksConnIDBase). SOCKS dials use IDs >= socksConnIDBase;
+// mixing the two spaces overwrites entries in Server.connections / Client.connections.
+func (s *Server) allocConnID() uint32 {
+	for {
+		id := atomic.AddUint32(&s.nextConnID, 1)
+		if id > 0 && id < socksConnIDBase {
+			return id
+		}
+		// Wrap back into the server-assigned space below SOCKS IDs.
+		atomic.CompareAndSwapUint32(&s.nextConnID, id, 0)
 	}
 }
 
@@ -562,6 +575,12 @@ func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {
 	if routeKey == "" {
 		return
 	}
+	// SOCKS dial ConnIDs must use the high ID space; low IDs are server-assigned for port-forward.
+	if pkt.ConnID < socksConnIDBase {
+		log.Printf("[server] SOCKS dial conn %d rejected (ConnID below socks space)", pkt.ConnID)
+		s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		return
+	}
 	target := normalizeSocksDialTarget(string(pkt.Data))
 	if target == "" {
 		s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
@@ -805,7 +824,7 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 			continue
 		}
 
-		connID := atomic.AddUint32(&s.nextConnID, 1)
+		connID := s.allocConnID()
 		routeKey, clientID, ok := s.routeKeyForListener(keyHash, mapKey)
 		if !ok {
 			log.Printf("[server] conn %d: no active tunnel client for %s, rejecting %s", connID, listenAddr, tc.RemoteAddr())
@@ -908,7 +927,7 @@ func (s *Server) udpReadLoop(uc *net.UDPConn, listenAddr, targetAddr string, key
 			continue
 		}
 
-		connID := atomic.AddUint32(&s.nextConnID, 1)
+		connID := s.allocConnID()
 		mapKey := ListenerMapKey("udp", listenAddr)
 		routeKey, clientID, ok := s.routeKeyForListener(keyHash, mapKey)
 		if !ok {
