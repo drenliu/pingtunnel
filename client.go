@@ -768,7 +768,13 @@ func (c *Client) closeClientConn(cc *ClientConn, silent bool) {
 }
 
 func genBootEpoch() uint32 {
-	return genClientID()
+	// Server-assigned ConnIDs must stay below socksConnIDBase so they never collide
+	// with client-chosen SOCKS dial IDs (see allocConnID).
+	id := genClientID() % socksConnIDBase
+	if id == 0 {
+		return 1
+	}
+	return id
 }
 
 func genClientID() uint32 {
