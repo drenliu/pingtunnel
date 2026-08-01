@@ -411,24 +411,20 @@ func (c *Client) handleSocksDialAck(pkt *TunnelPacket) {
 }
 
 func (c *Client) handleConnect(pkt *TunnelPacket) {
-	var stale *ClientConn
 	c.mu.Lock()
-	if cc, exists := c.connections[pkt.ConnID]; exists {
-		delete(c.connections, pkt.ConnID)
-		stale = cc
+	if _, exists := c.connections[pkt.ConnID]; exists {
+		c.mu.Unlock()
+		// waitReady retransmits CmdConnect when ConnectAck is lost. Keep the
+		// live target session and re-ACK; tearing down here drops in-flight data.
+		c.enqueue(&TunnelPacket{Cmd: CmdConnectAck, ConnID: pkt.ConnID})
+		return
 	}
 	if c.pending[pkt.ConnID] {
 		c.mu.Unlock()
-		if stale != nil {
-			c.closeClientConn(stale, true)
-		}
 		return
 	}
 	c.pending[pkt.ConnID] = true
 	c.mu.Unlock()
-	if stale != nil {
-		c.closeClientConn(stale, true)
-	}
 
 	target := string(pkt.Data)
 	if target == "" {
