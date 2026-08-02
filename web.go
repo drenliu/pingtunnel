@@ -287,6 +287,15 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 			jsonErr(w, err.Error(), 404)
 			return
 		}
+		// RemoveKey only updates config; tear down the orphaned listeners/sessions
+		// so deleted keys stop accepting traffic and free listen ports for reuse.
+		if kc != nil {
+			mapKeys := make([]string, 0, len(kc.Rules))
+			for _, rule := range kc.Rules {
+				mapKeys = append(mapKeys, ListenerMapKey(rule.Protocol, rule.ListenAddr))
+			}
+			ws.srv.StopListenersForRemovedKey(kc.Hash, mapKeys)
+		}
 		fields := map[string]string{"actor_ip": remoteIP(r), "key_id": parts[0], "result": "ok"}
 		if kc != nil {
 			fields["key_hash"] = hashPrefix(kc.Hash)
@@ -382,11 +391,29 @@ func (ws *webServer) apiKeyRoutes(w http.ResponseWriter, r *http.Request, rest s
 	}
 
 	if len(parts) == 3 && parts[1] == "rules" && r.Method == "DELETE" {
+		// Capture listen map key before removal so we can stop the live listener.
+		// UpdateRule already restarts listeners; DELETE previously left them running,
+		// so revoked rules kept forwarding until process restart.
+		kc := ws.mgr.GetKeyByID(parts[0])
+		var mapKey string
+		var keyHash [16]byte
+		if kc != nil {
+			keyHash = kc.Hash
+			for _, rule := range kc.Rules {
+				if rule.ID == parts[2] {
+					mapKey = ListenerMapKey(rule.Protocol, rule.ListenAddr)
+					break
+				}
+			}
+		}
 		if err := ws.mgr.RemoveRule(parts[0], parts[2]); err != nil {
 			jsonErr(w, err.Error(), 404)
 			return
 		}
-		kc := ws.mgr.GetKeyByID(parts[0])
+		if mapKey != "" {
+			ws.srv.RestartListenersAfterRuleChange(keyHash, mapKey, "")
+		}
+		kc = ws.mgr.GetKeyByID(parts[0])
 		fields := map[string]string{
 			"actor_ip": remoteIP(r),
 			"key_id":   parts[0],
