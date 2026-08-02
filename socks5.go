@@ -161,7 +161,9 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 	c.connections[connID] = cc
 	c.mu.Unlock()
 
-	go c.readTarget(cc)
+	// Must not return here: defer tc.Close() would reset the SOCKS client while
+	// the tunnel relay is still active. serveSOCKSConn already runs in its own goroutine.
+	c.readTarget(cc)
 }
 
 const socksConnIDBase uint32 = 0x60000000
