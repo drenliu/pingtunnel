@@ -717,7 +717,29 @@ func (s *Server) RestartListenersAfterRuleChange(keyHash [16]byte, oldMapKey, ne
 	if strings.TrimSpace(newMapKey) != "" {
 		affected[newMapKey] = true
 	}
+	s.stopListenersAndSessions(keyHash, affected, false)
+	s.StartConfiguredListeners()
+}
 
+// StopListenersForRemovedKey tears down listeners/sessions for a key already deleted
+// from the manager, then re-binds any remaining configured listeners (other keys).
+func (s *Server) StopListenersForRemovedKey(keyHash [16]byte, mapKeys []string) {
+	if atomic.LoadInt32(&s.closed) == 1 {
+		return
+	}
+	affected := map[string]bool{}
+	for _, mk := range mapKeys {
+		if strings.TrimSpace(mk) != "" {
+			affected[mk] = true
+		}
+	}
+	s.stopListenersAndSessions(keyHash, affected, true)
+	s.StartConfiguredListeners()
+}
+
+// stopListenersAndSessions closes the given listen map keys and all sessions for keyHash.
+// When fullKey is true, also drops that key's send queues / DNS route size / all rule-tunnel state.
+func (s *Server) stopListenersAndSessions(keyHash [16]byte, affected map[string]bool, fullKey bool) {
 	s.mu.Lock()
 	for mk := range affected {
 		if ln, ok := s.listenersTCP[mk]; ok {
@@ -742,6 +764,26 @@ func (s *Server) RestartListenersAfterRuleChange(keyHash [16]byte, oldMapKey, ne
 	}
 
 	prefix := hex.EncodeToString(keyHash[:]) + "|"
+	if fullKey {
+		s.sendQueuesMu.Lock()
+		for k := range s.sendQueues {
+			if strings.HasPrefix(k, prefix) {
+				delete(s.sendQueues, k)
+			}
+		}
+		s.sendQueuesMu.Unlock()
+		s.clearDNSRouteUDPSizePrefix(prefix)
+
+		s.ruleTunnelMu.Lock()
+		for k := range s.ruleTunnelClients {
+			if strings.HasPrefix(k, prefix) {
+				delete(s.ruleTunnelClients, k)
+			}
+		}
+		s.ruleTunnelMu.Unlock()
+		return
+	}
+
 	s.ruleTunnelMu.Lock()
 	for k := range s.ruleTunnelClients {
 		if !strings.HasPrefix(k, prefix) {
@@ -755,13 +797,15 @@ func (s *Server) RestartListenersAfterRuleChange(keyHash [16]byte, oldMapKey, ne
 		}
 	}
 	s.ruleTunnelMu.Unlock()
-
-	s.StartConfiguredListeners()
 }
 
-func (s *Server) removeTCPListenerMapKey(mapKey string) {
+// removeTCPListenerMapKey deletes mapKey only when it still points at ln.
+// A newer listener may already own the slot after a rule/key recreate.
+func (s *Server) removeTCPListenerMapKey(mapKey string, ln net.Listener) {
 	s.mu.Lock()
-	delete(s.listenersTCP, mapKey)
+	if cur, ok := s.listenersTCP[mapKey]; ok && cur == ln {
+		delete(s.listenersTCP, mapKey)
+	}
 	s.mu.Unlock()
 }
 
@@ -813,11 +857,11 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 		tc, err := ln.Accept()
 		if err != nil {
 			if atomic.LoadInt32(&s.closed) != 0 {
-				s.removeTCPListenerMapKey(mapKey)
+				s.removeTCPListenerMapKey(mapKey, ln)
 				return
 			}
 			if errors.Is(err, net.ErrClosed) {
-				s.removeTCPListenerMapKey(mapKey)
+				s.removeTCPListenerMapKey(mapKey, ln)
 				return
 			}
 			log.Printf("[server] accept: %v", err)
@@ -890,7 +934,9 @@ func (s *Server) startUDPListener(listenAddr, targetAddr string, keyHash [16]byt
 	s.udpReadLoop(uc, listenAddr, targetAddr, keyHash)
 
 	s.mu.Lock()
-	delete(s.listenersUDP, mapKey)
+	if cur, ok := s.listenersUDP[mapKey]; ok && cur == uc {
+		delete(s.listenersUDP, mapKey)
+	}
 	s.mu.Unlock()
 	uc.Close()
 	log.Printf("[server] UDP listener stopped %s", listenAddr)
