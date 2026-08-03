@@ -51,6 +51,8 @@ type Server struct {
 	listenersUDP map[string]*net.UDPConn
 	udpSessions  map[string]*ServerConn // key: listenAddr|remoteUDP
 	connections  map[uint32]*ServerConn
+	// socksDialing: ConnIDs with an in-flight SOCKS DialTimeout (not yet in connections).
+	socksDialing map[uint32]struct{}
 	nextConnID   uint32
 
 	mu        sync.RWMutex
@@ -117,6 +119,7 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dn
 		listenersUDP:      make(map[string]*net.UDPConn),
 		udpSessions:       make(map[string]*ServerConn),
 		connections:       make(map[uint32]*ServerConn),
+		socksDialing:      make(map[uint32]struct{}),
 		done:              make(chan struct{}),
 		bootEpoch:         bootEpoch,
 		nextConnID:        bootEpoch, // avoid connID reuse across restarts (stale CmdClose); kept < socksConnIDBase
@@ -588,21 +591,48 @@ func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {
 	}
 
 	s.mu.Lock()
-	if _, exists := s.connections[pkt.ConnID]; exists {
+	if sc, exists := s.connections[pkt.ConnID]; exists {
+		alive := atomic.LoadInt32(&sc.closed) == 0
 		s.mu.Unlock()
-		s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		// Retransmit/duplicate after success: keep the live session and re-ACK.
+		// Closing here tears down working SOCKS relays under normal ICMP/DNS loss.
+		if alive {
+			s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdSocksDialAck, ConnID: pkt.ConnID})
+		}
 		return
 	}
+	if _, dialing := s.socksDialing[pkt.ConnID]; dialing {
+		s.mu.Unlock()
+		// Duplicate while DialTimeout is in flight — wait for the first attempt.
+		return
+	}
+	s.socksDialing[pkt.ConnID] = struct{}{}
 	s.mu.Unlock()
+
+	// Dial off the tunnel read loop: DialTimeout can block up to 15s and would
+	// otherwise stall ICMP/DNS handling for every client on this transport.
+	go s.completeSocksDial(pkt, routeKey, target)
+}
+
+func (s *Server) completeSocksDial(pkt *TunnelPacket, routeKey, target string) {
+	connID := pkt.ConnID
+	defer func() {
+		s.mu.Lock()
+		delete(s.socksDialing, connID)
+		s.mu.Unlock()
+	}()
 
 	conn, err := net.DialTimeout("tcp", target, 15*time.Second)
 	if err != nil {
-		log.Printf("[server] SOCKS dial %d %s: %v", pkt.ConnID, target, err)
-		s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		log.Printf("[server] SOCKS dial %d %s: %v", connID, target, err)
+		s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdClose, ConnID: connID})
+		return
+	}
+	if atomic.LoadInt32(&s.closed) != 0 {
+		conn.Close()
 		return
 	}
 
-	connID := pkt.ConnID
 	sc := &ServerConn{
 		id:         connID,
 		proto:      "tcp",
@@ -621,7 +651,14 @@ func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {
 	)
 
 	s.mu.Lock()
+	if _, exists := s.connections[connID]; exists {
+		s.mu.Unlock()
+		conn.Close()
+		s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdSocksDialAck, ConnID: connID})
+		return
+	}
 	s.connections[connID] = sc
+	delete(s.socksDialing, connID)
 	s.mu.Unlock()
 
 	sc.readyOnce.Do(func() { close(sc.ready) })
