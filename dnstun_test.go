@@ -177,6 +177,50 @@ func TestMaxTunnelPayloadForDNSResponseSmallerThanRequest(t *testing.T) {
 	}
 }
 
+func TestDNSMaxDataChunkNeverExceedsPackable(t *testing.T) {
+	// Long QNAMEs at the minimum EDNS size used to force a floor of 64 even when
+	// maxTunnelPayloadForDNSResponse was smaller, producing un-packable CmdData.
+	names := []string{
+		"c.pingt.local",
+		"tunnel.very.long.subdomain.example.company.internal",
+		"a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z.example.com",
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.example.com",
+	}
+	for _, name := range names {
+		for _, sz := range []uint16{256, 512, 1024, 1232} {
+			for _, forResponse := range []bool{false, true} {
+				chunk := dnsMaxDataChunk(name, sz, forResponse)
+				max := maxTunnelPayloadForDNSRequest(name, sz)
+				if forResponse {
+					max = maxTunnelPayloadForDNSResponse(name, sz)
+				}
+				if chunk != max && !(chunk == MaxPayloadSize && max > MaxPayloadSize) {
+					t.Fatalf("name=%q sz=%d forResponse=%v chunk=%d max=%d", name, sz, forResponse, chunk, max)
+				}
+				if chunk <= 0 {
+					continue
+				}
+				magic := MagicRequest
+				if forResponse {
+					magic = MagicResponse
+				}
+				pkt := &TunnelPacket{Magic: magic, Cmd: CmdData, ConnID: 1, Seq: 1, Data: make([]byte, chunk)}
+				raw, err := pkt.Encode()
+				if err != nil {
+					t.Fatalf("encode name=%q sz=%d: %v", name, sz, err)
+				}
+				if forResponse {
+					if _, err := buildDNSResponseWithSize(templateDNSRequest(name), raw, sz); err != nil {
+						t.Fatalf("response pack name=%q sz=%d chunk=%d: %v", name, sz, chunk, err)
+					}
+				} else if _, err := buildDNSRequestWithSize(1, name, raw, sz); err != nil {
+					t.Fatalf("request pack name=%q sz=%d chunk=%d: %v", name, sz, chunk, err)
+				}
+			}
+		}
+	}
+}
+
 func TestExtractEDNSUDPSize(t *testing.T) {
 	wire, err := buildDNSRequestWithSize(9, "c.pingt.local", []byte("x"), 1024)
 	if err != nil {
