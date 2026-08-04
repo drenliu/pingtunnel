@@ -493,12 +493,23 @@ func (c *Client) readTarget(cc *ClientConn) {
 		}
 	}()
 
-	chunk := MaxPayloadSize
-	if c.transport == "dns" {
-		chunk = c.dnsMaxDataChunk()
-	}
-	buf := make([]byte, chunk)
+	var buf []byte
 	for {
+		// Recompute each read so a mid-session EDNS shrink cannot leave a
+		// sticky oversized CmdData frame that fails to pack.
+		chunk := MaxPayloadSize
+		if c.transport == "dns" {
+			chunk = c.dnsMaxDataChunk()
+			if chunk <= 0 {
+				log.Printf("[client] conn %d: no DNS payload budget", cc.id)
+				return
+			}
+		}
+		if cap(buf) < chunk {
+			buf = make([]byte, chunk)
+		} else {
+			buf = buf[:chunk]
+		}
 		n, err := cc.tcpConn.Read(buf)
 		if err != nil {
 			return

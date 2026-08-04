@@ -201,6 +201,8 @@ func maxTunnelPayloadForDNSResponse(qname string, udpSize uint16) int {
 
 // dnsMaxDataChunk is the largest CmdData payload per DNS frame.
 // forResponse: true when data is sent in DNS responses (server → client).
+// Returns 0 when no CmdData payload fits (caller must not invent a larger floor —
+// a previous floor of 64 produced frames that can never pack into the UDP budget).
 func dnsMaxDataChunk(qname string, udpSize uint16, forResponse bool) int {
 	var chunk int
 	if forResponse {
@@ -208,8 +210,8 @@ func dnsMaxDataChunk(qname string, udpSize uint16, forResponse bool) int {
 	} else {
 		chunk = maxTunnelPayloadForDNSRequest(qname, udpSize)
 	}
-	if chunk < 64 {
-		return 64
+	if chunk < 0 {
+		return 0
 	}
 	if chunk > MaxPayloadSize {
 		return MaxPayloadSize

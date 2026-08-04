@@ -385,8 +385,28 @@ func (s *Server) dnsReadLoop(c net.PacketConn) {
 		}
 		dnsOut, err := buildDNSResponseWithSize(m, respData, udpSize)
 		if err != nil {
+			// Dequeue already removed the frame; put it back and answer with Ping
+			// so the DNS query still completes. Dropping here permanently loses
+			// CmdData/control under MTU/EDNS mismatches.
 			log.Printf("[server] DNS response: %v", err)
-			continue
+			if resp.Cmd != CmdPing {
+				resp.Flags &^= FlagMore
+				s.enqueueRoute(routeKey, resp)
+			}
+			ping := &TunnelPacket{
+				Magic:    MagicResponse,
+				KeyHash:  clientKeyHash,
+				ClientID: clientID,
+				Cmd:      CmdPing,
+			}
+			pingData, encErr := ping.Encode()
+			if encErr != nil {
+				continue
+			}
+			dnsOut, err = buildDNSResponseWithSize(m, pingData, udpSize)
+			if err != nil {
+				continue
+			}
 		}
 		_, _ = c.WriteTo(dnsOut, addr)
 		atomic.AddUint64(&s.stats.tunOut, 1)
@@ -1010,16 +1030,28 @@ func (s *Server) waitReady(sc *ServerConn) {
 
 func (s *Server) readTCP(sc *ServerConn) {
 	defer s.closeConn(sc)
-	chunk := MaxPayloadSize
-	if s.serveDNS {
-		udpSize := s.dnsUDPSizeForRoute(sc.routeKey)
-		if udpSize == 0 {
-			udpSize = dnsUDPSizeDefault
-		}
-		chunk = dnsMaxDataChunk(normQName(s.dnsQName), udpSize, true)
-	}
-	buf := make([]byte, chunk)
+	var buf []byte
 	for atomic.LoadInt32(&sc.closed) == 0 {
+		// Recompute each read: negotiated EDNS size can shrink mid-session.
+		// A sticky oversized buffer produces CmdData frames that dnsReadLoop
+		// cannot pack (previously dropped after dequeue).
+		chunk := MaxPayloadSize
+		if s.serveDNS {
+			udpSize := s.dnsUDPSizeForRoute(sc.routeKey)
+			if udpSize == 0 {
+				udpSize = dnsUDPSizeDefault
+			}
+			chunk = dnsMaxDataChunk(normQName(s.dnsQName), udpSize, true)
+			if chunk <= 0 {
+				log.Printf("[server] conn %d: no DNS payload budget for route size %d", sc.id, udpSize)
+				return
+			}
+		}
+		if cap(buf) < chunk {
+			buf = make([]byte, chunk)
+		} else {
+			buf = buf[:chunk]
+		}
 		n, err := sc.tcpConn.Read(buf)
 		if err != nil {
 			return
