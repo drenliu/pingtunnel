@@ -1182,11 +1182,18 @@ func (s *Server) retransmitLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			var dead []*ServerConn
 			s.mu.RLock()
 			for _, sc := range s.connections {
-				sc.reliSend.Retransmit()
+				if sc.reliSend != nil && sc.reliSend.Retransmit() {
+					dead = append(dead, sc)
+				}
 			}
 			s.mu.RUnlock()
+			for _, sc := range dead {
+				log.Printf("[server] conn %d: reliable send expired, closing", sc.id)
+				s.closeConn(sc)
+			}
 		case <-s.done:
 			return
 		}

@@ -3,6 +3,7 @@ package main
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReliableSendSendAndAck(t *testing.T) {
@@ -96,5 +97,48 @@ func TestReliableRecvDuplicateIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("duplicate seq should not deliver again, n=%d", n)
+	}
+}
+
+func TestReliableSendRetransmitExpireReturnsDead(t *testing.T) {
+	rs := NewReliableSend(42, func(*TunnelPacket) {})
+	if !rs.Send([]byte("lost")) {
+		t.Fatal("Send failed")
+	}
+	rs.mu.Lock()
+	for _, e := range rs.pending {
+		e.retries = maxRetries
+		e.sentAt = time.Now().Add(-retransmitTimeout - time.Millisecond)
+	}
+	rs.mu.Unlock()
+
+	if !rs.Retransmit() {
+		t.Fatal("expected dead=true after exceeding maxRetries")
+	}
+	if rs.PendingCount() != 0 {
+		t.Fatalf("expired packet should be removed, pending=%d", rs.PendingCount())
+	}
+}
+
+func TestReliableSendRetransmitLiveReturnsFalse(t *testing.T) {
+	var n int
+	rs := NewReliableSend(1, func(*TunnelPacket) { n++ })
+	if !rs.Send([]byte("x")) {
+		t.Fatal("Send failed")
+	}
+	rs.mu.Lock()
+	for _, e := range rs.pending {
+		e.sentAt = time.Now().Add(-retransmitTimeout - time.Millisecond)
+	}
+	rs.mu.Unlock()
+
+	if rs.Retransmit() {
+		t.Fatal("first retransmit should not expire")
+	}
+	if rs.PendingCount() != 1 {
+		t.Fatalf("pending=%d", rs.PendingCount())
+	}
+	if n < 2 { // original Send + retransmit
+		t.Fatalf("expected resend, enqueue count=%d", n)
 	}
 }

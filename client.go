@@ -603,11 +603,23 @@ func (c *Client) retransmitLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			var dead []*ClientConn
 			c.mu.RLock()
 			for _, cc := range c.connections {
-				cc.reliSend.Retransmit()
+				if cc.reliSend != nil && cc.reliSend.Retransmit() {
+					dead = append(dead, cc)
+				}
 			}
 			c.mu.RUnlock()
+			for _, cc := range dead {
+				log.Printf("[client] conn %d: reliable send expired, closing", cc.id)
+				c.mu.Lock()
+				delete(c.connections, cc.id)
+				c.mu.Unlock()
+				// silent: readTarget defer must not send a second CmdClose
+				c.closeClientConn(cc, true)
+				c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: cc.id})
+			}
 		case <-c.done:
 			return
 		}

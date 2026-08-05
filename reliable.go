@@ -70,11 +70,14 @@ func (rs *ReliableSend) Ack(seq uint32) {
 }
 
 // Retransmit re-enqueues unacked packets that are older than the timeout.
-func (rs *ReliableSend) Retransmit() {
+// It returns true when any packet exceeded maxRetries and was dropped: the
+// caller must tear down the connection. Leaving the stream open after a gap
+// permanently stalls the peer reorder buffer (nextSeq never advances).
+func (rs *ReliableSend) Retransmit() (dead bool) {
 	rs.mu.Lock()
 	if rs.closed {
 		rs.mu.Unlock()
-		return
+		return false
 	}
 	now := time.Now()
 	var resend []*sendEntry
@@ -93,11 +96,13 @@ func (rs *ReliableSend) Retransmit() {
 	for _, seq := range expired {
 		delete(rs.pending, seq)
 	}
+	dead = len(expired) > 0
 	rs.mu.Unlock()
 
 	for _, e := range resend {
 		rs.enqueue(&TunnelPacket{Cmd: CmdData, ConnID: rs.connID, Seq: e.seq, Data: e.data})
 	}
+	return dead
 }
 
 func (rs *ReliableSend) Close() {
