@@ -22,6 +22,14 @@ func normalizeSocksDialTarget(s string) string {
 	return net.JoinHostPort(s, "80")
 }
 
+// socksDialWaitTimeout: how long the SOCKS client waits for CmdSocksDialAck.
+// Overridable in tests. Keep in sync with server socksDialAckRetryWindow.
+var socksDialWaitTimeout = 25 * time.Second
+
+// socksDialAckRetryWindow: server re-sends CmdSocksDialAck for this long after dial.
+// Slightly longer than the client wait so a late ack can still land before timeout.
+const socksDialAckRetryWindow = 30 * time.Second
+
 // startSOCKS5 listens for SOCKS5 TCP CONNECT and tunnels via ICMP (CmdSocksDial).
 func (c *Client) startSOCKS5(addr string) {
 	ln, err := net.Listen("tcp", addr)
@@ -128,15 +136,18 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 	var ok bool
 	select {
 	case ok = <-ch:
-	case <-time.After(25 * time.Second):
+	case <-time.After(socksDialWaitTimeout):
 		c.socksMu.Lock()
 		delete(c.socksWait, connID)
 		c.socksMu.Unlock()
+		// Server may have dialed successfully while DialAck was lost; tear it down.
+		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: connID})
 		ok = false
 	case <-c.done:
 		c.socksMu.Lock()
 		delete(c.socksWait, connID)
 		c.socksMu.Unlock()
+		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: connID})
 		return
 	}
 
