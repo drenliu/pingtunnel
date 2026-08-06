@@ -628,7 +628,34 @@ func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {
 	s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdSocksDialAck, ConnID: connID})
 	log.Printf("[server] SOCKS conn %d -> %s (route=%s)", connID, target, routeKey)
 
+	// DialAck is not covered by ReliableSend. Retransmit like waitReady's CmdConnect
+	// retries so a single lost ICMP/DNS reply does not leave the client waiting until
+	// timeout while this side already holds a live target connection.
+	go s.retrySocksDialAck(sc)
 	go s.readTCP(sc)
+}
+
+// retrySocksDialAck re-enqueues CmdSocksDialAck until the session closes or the
+// client wait window elapses. Extra acks after the client has already succeeded
+// are ignored (socksWait entry is gone).
+func (s *Server) retrySocksDialAck(sc *ServerConn) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	timeout := time.NewTimer(socksDialAckRetryWindow)
+	defer timeout.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if atomic.LoadInt32(&sc.closed) != 0 {
+				return
+			}
+			s.enqueueRoute(sc.routeKey, &TunnelPacket{Cmd: CmdSocksDialAck, ConnID: sc.id})
+		case <-timeout.C:
+			return
+		case <-s.done:
+			return
+		}
+	}
 }
 
 // --------------- auto-start ---------------
