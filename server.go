@@ -49,9 +49,13 @@ type Server struct {
 
 	listenersTCP map[string]net.Listener
 	listenersUDP map[string]*net.UDPConn
-	udpSessions  map[string]*ServerConn // key: listenAddr|remoteUDP
-	connections  map[uint32]*ServerConn
-	nextConnID   uint32
+	// listenerBinds records which tunnel key/target owns each listen map key.
+	// handleSetup must not CmdSetupAck a client for a port owned by another key
+	// or still bound to a different target.
+	listenerBinds map[string]*listenerBind
+	udpSessions   map[string]*ServerConn // key: listenAddr|remoteUDP
+	connections   map[uint32]*ServerConn
+	nextConnID    uint32
 
 	mu        sync.RWMutex
 	closed    int32
@@ -64,6 +68,14 @@ type Server struct {
 		badKey     uint64
 		retransmit uint64
 	}
+}
+
+// listenerBind is the forwarding identity of an active TCP/UDP listen port.
+type listenerBind struct {
+	keyHash    [16]byte
+	listenAddr string
+	targetAddr string
+	protocol   string
 }
 
 type ServerConn struct {
@@ -115,6 +127,7 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dn
 		ruleTunnelClients: make(map[string]*ruleTunnelState),
 		listenersTCP:      make(map[string]net.Listener),
 		listenersUDP:      make(map[string]*net.UDPConn),
+		listenerBinds:     make(map[string]*listenerBind),
 		udpSessions:       make(map[string]*ServerConn),
 		connections:       make(map[uint32]*ServerConn),
 		done:              make(chan struct{}),
@@ -155,6 +168,9 @@ func (s *Server) Close() {
 	for _, u := range s.listenersUDP {
 		u.Close()
 	}
+	s.listenersTCP = make(map[string]net.Listener)
+	s.listenersUDP = make(map[string]*net.UDPConn)
+	s.listenerBinds = make(map[string]*listenerBind)
 	for _, sc := range s.connections {
 		if atomic.CompareAndSwapInt32(&sc.closed, 0, 1) {
 			if sc.tcpConn != nil {
@@ -443,21 +459,18 @@ func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
 	}
 
 	mapKey := ListenerMapKey(protocol, listenAddr)
-	s.mu.RLock()
-	exists := false
-	if protocol == "udp" {
-		_, exists = s.listenersUDP[mapKey]
-	} else {
-		_, exists = s.listenersTCP[mapKey]
-	}
-	s.mu.RUnlock()
-
-	if !exists {
-		if protocol == "udp" {
-			go s.startUDPListener(listenAddr, targetAddr, pkt.KeyHash)
-		} else {
-			go s.startTCPListener(listenAddr, targetAddr, pkt.KeyHash)
-		}
+	if err := s.ensureForwardListener(listenAddr, targetAddr, protocol, pkt.KeyHash); err != nil {
+		Audit("tunnel.setup.rejected", mergeFields(auditKeyFields(s.manager, pkt.KeyHash), map[string]string{
+			"listen_addr": listenAddr,
+			"target_addr": targetAddr,
+			"protocol":    protocol,
+			"client_addr": addrString(from),
+			"client_id":   fmt.Sprintf("%08x", pkt.ClientID),
+			"result":      "denied",
+			"detail":      err.Error(),
+		}))
+		log.Printf("[server] setup rejected: %s -> %s (%s): %v", listenAddr, targetAddr, protocol, err)
+		return
 	}
 	_, _, wasOnline := s.routeKeyForListener(pkt.KeyHash, mapKey)
 	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck, Data: s.setupAckPayload()})
@@ -473,6 +486,89 @@ func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
 		}))
 		log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s", listenAddr, targetAddr, protocol)
 	}
+}
+
+// ensureForwardListener makes sure a listen port is bound for this key/target.
+// It refuses to CmdSetupAck over another key's listener (or a stale target bind).
+func (s *Server) ensureForwardListener(listenAddr, targetAddr, protocol string, keyHash [16]byte) error {
+	mapKey := ListenerMapKey(protocol, listenAddr)
+
+	s.mu.Lock()
+	bind := s.listenerBinds[mapKey]
+	var lnExists bool
+	if protocol == "udp" {
+		_, lnExists = s.listenersUDP[mapKey]
+	} else {
+		_, lnExists = s.listenersTCP[mapKey]
+	}
+	if bind != nil && lnExists {
+		if bind.keyHash != keyHash {
+			s.mu.Unlock()
+			return fmt.Errorf("listen %s already owned by another tunnel key", listenAddr)
+		}
+		if bind.targetAddr == targetAddr {
+			s.mu.Unlock()
+			return nil
+		}
+		// Same key, target changed (e.g. allow_all client -t update): rebind below.
+		s.mu.Unlock()
+		s.rebindForwardListener(keyHash, listenAddr, targetAddr, protocol)
+		return s.startForwardListener(listenAddr, targetAddr, protocol, keyHash)
+	}
+	// Listener map and bind metadata should stay aligned; repair if not.
+	if bind != nil && !lnExists {
+		delete(s.listenerBinds, mapKey)
+	}
+	s.mu.Unlock()
+
+	return s.startForwardListener(listenAddr, targetAddr, protocol, keyHash)
+}
+
+func (s *Server) startForwardListener(listenAddr, targetAddr, protocol string, keyHash [16]byte) error {
+	if protocol == "udp" {
+		return s.startUDPListener(listenAddr, targetAddr, keyHash)
+	}
+	return s.startTCPListener(listenAddr, targetAddr, keyHash)
+}
+
+// rebindForwardListener closes an existing listen port and sessions that used the
+// previous target so a new target can own the same map key.
+func (s *Server) rebindForwardListener(keyHash [16]byte, listenAddr, targetAddr, protocol string) {
+	mapKey := ListenerMapKey(protocol, listenAddr)
+	s.mu.Lock()
+	oldTarget := ""
+	if bind := s.listenerBinds[mapKey]; bind != nil {
+		oldTarget = bind.targetAddr
+	}
+	if ln, ok := s.listenersTCP[mapKey]; ok {
+		ln.Close()
+		delete(s.listenersTCP, mapKey)
+	}
+	if uc, ok := s.listenersUDP[mapKey]; ok {
+		uc.Close()
+		delete(s.listenersUDP, mapKey)
+	}
+	delete(s.listenerBinds, mapKey)
+	var toClose []*ServerConn
+	for _, sc := range s.connections {
+		if sc.keyHash == keyHash && sc.targetAddr == oldTarget && oldTarget != "" && oldTarget != targetAddr {
+			toClose = append(toClose, sc)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, sc := range toClose {
+		s.closeConn(sc)
+	}
+
+	prefix := hex.EncodeToString(keyHash[:]) + "|"
+	s.ruleTunnelMu.Lock()
+	for k := range s.ruleTunnelClients {
+		if strings.HasPrefix(k, prefix) && strings.HasSuffix(k, "|"+mapKey) {
+			delete(s.ruleTunnelClients, k)
+		}
+	}
+	s.ruleTunnelMu.Unlock()
 }
 
 func (s *Server) handleConnectAck(pkt *TunnelPacket, from net.Addr) {
@@ -669,6 +765,7 @@ func (s *Server) RestartListenersAfterKeyHashChange(prevKeyHash [16]byte, keyID 
 			uc.Close()
 			delete(s.listenersUDP, mk)
 		}
+		delete(s.listenerBinds, mk)
 	}
 	var toClose []*ServerConn
 	for _, sc := range s.connections {
@@ -728,6 +825,7 @@ func (s *Server) RestartListenersAfterRuleChange(keyHash [16]byte, oldMapKey, ne
 			uc.Close()
 			delete(s.listenersUDP, mk)
 		}
+		delete(s.listenerBinds, mk)
 	}
 	var toClose []*ServerConn
 	for _, sc := range s.connections {
@@ -762,6 +860,18 @@ func (s *Server) RestartListenersAfterRuleChange(keyHash [16]byte, oldMapKey, ne
 func (s *Server) removeTCPListenerMapKey(mapKey string) {
 	s.mu.Lock()
 	delete(s.listenersTCP, mapKey)
+	delete(s.listenerBinds, mapKey)
+	s.mu.Unlock()
+}
+
+// removeTCPListenerIfCurrent clears map state only when ln is still the registered
+// listener. Needed so a rebind's old accept loop cannot delete the replacement.
+func (s *Server) removeTCPListenerIfCurrent(mapKey string, ln net.Listener) {
+	s.mu.Lock()
+	if cur, ok := s.listenersTCP[mapKey]; ok && cur == ln {
+		delete(s.listenersTCP, mapKey)
+		delete(s.listenerBinds, mapKey)
+	}
 	s.mu.Unlock()
 }
 
@@ -779,10 +889,8 @@ func (s *Server) StartConfiguredListeners() {
 			}
 			s.mu.RUnlock()
 			if !exists {
-				if r.Protocol == "udp" {
-					go s.startUDPListener(r.ListenAddr, r.TargetAddr, kc.Hash)
-				} else {
-					go s.startTCPListener(r.ListenAddr, r.TargetAddr, kc.Hash)
+				if err := s.startForwardListener(r.ListenAddr, r.TargetAddr, r.Protocol, kc.Hash); err != nil {
+					log.Printf("[server] start listener %s: %v", mapKey, err)
 				}
 			}
 		}
@@ -791,33 +899,53 @@ func (s *Server) StartConfiguredListeners() {
 
 // --------------- TCP ---------------
 
-func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byte) {
+// startTCPListener binds listenAddr and runs the accept loop in a background goroutine.
+// On success the listener is registered before return so callers can CmdSetupAck safely.
+func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byte) error {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Printf("[server] listen %s: %v", listenAddr, err)
-		return
+		return fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
 	mapKey := ListenerMapKey("tcp", listenAddr)
 	s.mu.Lock()
 	if _, exists := s.listenersTCP[mapKey]; exists {
+		bind := s.listenerBinds[mapKey]
 		s.mu.Unlock()
 		ln.Close()
-		return
+		if bind != nil && bind.keyHash == keyHash && bind.targetAddr == targetAddr {
+			return nil
+		}
+		return fmt.Errorf("listen %s already active", listenAddr)
+	}
+	if bind := s.listenerBinds[mapKey]; bind != nil && bind.keyHash != keyHash {
+		s.mu.Unlock()
+		ln.Close()
+		return fmt.Errorf("listen %s already owned by another tunnel key", listenAddr)
 	}
 	s.listenersTCP[mapKey] = ln
+	s.listenerBinds[mapKey] = &listenerBind{
+		keyHash:    keyHash,
+		listenAddr: listenAddr,
+		targetAddr: targetAddr,
+		protocol:   "tcp",
+	}
 	s.mu.Unlock()
 
 	log.Printf("[server] TCP listening on %s", listenAddr)
+	go s.acceptTCPLoop(ln, mapKey, listenAddr, targetAddr, keyHash)
+	return nil
+}
 
+func (s *Server) acceptTCPLoop(ln net.Listener, mapKey, listenAddr, targetAddr string, keyHash [16]byte) {
 	for atomic.LoadInt32(&s.closed) == 0 {
 		tc, err := ln.Accept()
 		if err != nil {
 			if atomic.LoadInt32(&s.closed) != 0 {
-				s.removeTCPListenerMapKey(mapKey)
+				s.removeTCPListenerIfCurrent(mapKey, ln)
 				return
 			}
 			if errors.Is(err, net.ErrClosed) {
-				s.removeTCPListenerMapKey(mapKey)
+				s.removeTCPListenerIfCurrent(mapKey, ln)
 				return
 			}
 			log.Printf("[server] accept: %v", err)
@@ -863,34 +991,55 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 	}
 }
 
-func (s *Server) startUDPListener(listenAddr, targetAddr string, keyHash [16]byte) {
+// startUDPListener binds listenAddr and runs the UDP read loop in a background goroutine.
+func (s *Server) startUDPListener(listenAddr, targetAddr string, keyHash [16]byte) error {
 	pc, err := net.ListenPacket("udp", listenAddr)
 	if err != nil {
-		log.Printf("[server] UDP listen %s: %v", listenAddr, err)
-		return
+		return fmt.Errorf("UDP listen %s: %w", listenAddr, err)
 	}
 	uc, ok := pc.(*net.UDPConn)
 	if !ok {
 		pc.Close()
-		log.Printf("[server] UDP listen %s: unexpected conn type", listenAddr)
-		return
+		return fmt.Errorf("UDP listen %s: unexpected conn type", listenAddr)
 	}
 	mapKey := ListenerMapKey("udp", listenAddr)
 	s.mu.Lock()
 	if _, exists := s.listenersUDP[mapKey]; exists {
+		bind := s.listenerBinds[mapKey]
 		s.mu.Unlock()
 		uc.Close()
-		return
+		if bind != nil && bind.keyHash == keyHash && bind.targetAddr == targetAddr {
+			return nil
+		}
+		return fmt.Errorf("UDP listen %s already active", listenAddr)
+	}
+	if bind := s.listenerBinds[mapKey]; bind != nil && bind.keyHash != keyHash {
+		s.mu.Unlock()
+		uc.Close()
+		return fmt.Errorf("listen %s already owned by another tunnel key", listenAddr)
 	}
 	s.listenersUDP[mapKey] = uc
+	s.listenerBinds[mapKey] = &listenerBind{
+		keyHash:    keyHash,
+		listenAddr: listenAddr,
+		targetAddr: targetAddr,
+		protocol:   "udp",
+	}
 	s.mu.Unlock()
 
 	log.Printf("[server] UDP listening on %s", listenAddr)
+	go s.runUDPListener(uc, mapKey, listenAddr, targetAddr, keyHash)
+	return nil
+}
 
+func (s *Server) runUDPListener(uc *net.UDPConn, mapKey, listenAddr, targetAddr string, keyHash [16]byte) {
 	s.udpReadLoop(uc, listenAddr, targetAddr, keyHash)
 
 	s.mu.Lock()
-	delete(s.listenersUDP, mapKey)
+	if cur, ok := s.listenersUDP[mapKey]; ok && cur == uc {
+		delete(s.listenersUDP, mapKey)
+		delete(s.listenerBinds, mapKey)
+	}
 	s.mu.Unlock()
 	uc.Close()
 	log.Printf("[server] UDP listener stopped %s", listenAddr)

@@ -379,9 +379,15 @@ func (m *Manager) AddRule(keyID, listenAddr, targetAddr, protocol string) (*Forw
 	protocol = normalizeProtocol(protocol)
 	for _, kc := range m.keys {
 		if kc.ID == keyID {
+			wantMap := ListenerMapKey(protocol, listenAddr)
 			for _, r := range kc.Rules {
 				if r.ListenAddr == listenAddr && r.TargetAddr == targetAddr && r.Protocol == protocol {
 					return nil, fmt.Errorf("rule already exists")
+				}
+				// One listener per protocol+listen; a second target would get SetupAck
+				// while traffic still dialed the first rule's target.
+				if ListenerMapKey(r.Protocol, r.ListenAddr) == wantMap {
+					return nil, fmt.Errorf("listen address %s (%s) already used by another rule", listenAddr, protocol)
 				}
 			}
 			r := &ForwardRule{ID: randID(), ListenAddr: listenAddr, TargetAddr: targetAddr, Protocol: protocol}
@@ -434,12 +440,16 @@ func (m *Manager) UpdateRule(keyID, ruleID, listenAddr, targetAddr, protocol str
 		if rule == nil {
 			return nil, "", "", fmt.Errorf("rule not found")
 		}
+		wantMap := ListenerMapKey(protocol, listenAddr)
 		for _, r := range kc.Rules {
 			if r.ID == ruleID {
 				continue
 			}
 			if r.ListenAddr == listenAddr && r.TargetAddr == targetAddr && r.Protocol == protocol {
 				return nil, "", "", fmt.Errorf("rule already exists")
+			}
+			if ListenerMapKey(r.Protocol, r.ListenAddr) == wantMap {
+				return nil, "", "", fmt.Errorf("listen address %s (%s) already used by another rule", listenAddr, protocol)
 			}
 		}
 		oldMapKey := ListenerMapKey(rule.Protocol, rule.ListenAddr)
