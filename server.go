@@ -479,7 +479,7 @@ func (s *Server) handleConnectAck(pkt *TunnelPacket, from net.Addr) {
 	s.mu.RLock()
 	sc := s.connections[pkt.ConnID]
 	s.mu.RUnlock()
-	if sc != nil && s.matchRoute(sc, from) {
+	if sc != nil && s.matchRoute(sc, pkt.KeyHash, pkt.ClientID, from) {
 		sc.readyOnce.Do(func() { close(sc.ready) })
 		log.Printf("[server] conn %d: client ready", pkt.ConnID)
 	}
@@ -489,7 +489,7 @@ func (s *Server) handleData(pkt *TunnelPacket, from net.Addr) {
 	s.mu.RLock()
 	sc := s.connections[pkt.ConnID]
 	s.mu.RUnlock()
-	if sc == nil || len(pkt.Data) == 0 || !s.matchRoute(sc, from) {
+	if sc == nil || len(pkt.Data) == 0 || !s.matchRoute(sc, pkt.KeyHash, pkt.ClientID, from) {
 		return
 	}
 	s.manager.RecordIn(sc.keyHash, len(pkt.Data))
@@ -503,7 +503,7 @@ func (s *Server) handleDataAck(pkt *TunnelPacket, from net.Addr) {
 	s.mu.RLock()
 	sc := s.connections[pkt.ConnID]
 	s.mu.RUnlock()
-	if sc != nil && s.matchRoute(sc, from) {
+	if sc != nil && s.matchRoute(sc, pkt.KeyHash, pkt.ClientID, from) {
 		sc.reliSend.Ack(pkt.Seq)
 	}
 }
@@ -511,7 +511,7 @@ func (s *Server) handleDataAck(pkt *TunnelPacket, from net.Addr) {
 func (s *Server) handleClose(pkt *TunnelPacket, from net.Addr) {
 	s.mu.Lock()
 	sc, ok := s.connections[pkt.ConnID]
-	if ok && !s.matchRoute(sc, from) {
+	if ok && !s.matchRoute(sc, pkt.KeyHash, pkt.ClientID, from) {
 		s.mu.Unlock()
 		return
 	}
@@ -1330,8 +1330,15 @@ func (s *Server) routeKeyForListener(keyHash [16]byte, listenerMapKey string) (s
 	return qk, cid, true
 }
 
-func (s *Server) matchRoute(sc *ServerConn, from net.Addr) bool {
+// matchRoute ensures a tunnel packet may touch sc: ConnID alone is not enough.
+// Without keyHash/clientID checks, any valid key that learns a ConnID can inject
+// CmdData/CmdDataAck or CmdClose into another tenant's session (queue keys with
+// nonzero clientID ignore source address, so matchRoute previously always passed).
+func (s *Server) matchRoute(sc *ServerConn, keyHash [16]byte, clientID uint32, from net.Addr) bool {
 	if sc == nil || from == nil {
+		return false
+	}
+	if sc.keyHash != keyHash || sc.clientID != clientID {
 		return false
 	}
 	return sc.routeKey == s.queueKeyForAddr(sc.keyHash, sc.clientID, from)
