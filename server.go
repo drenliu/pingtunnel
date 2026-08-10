@@ -66,6 +66,13 @@ type Server struct {
 	}
 }
 
+// Cap UDP datagrams buffered before CmdConnectAck. Without a bound, any peer
+// that can reach a UDP listen port can OOM the server during the waitReady window.
+const (
+	maxUDPPendingDatagrams = 64
+	maxUDPPendingBytes     = 256 << 10 // 256 KiB
+)
+
 type ServerConn struct {
 	id         uint32
 	proto      string // "tcp" or "udp"
@@ -83,9 +90,10 @@ type ServerConn struct {
 	reliSend   *ReliableSend
 	reliRecv   *ReliableRecv
 
-	udpMu      sync.Mutex
-	udpReady   bool
-	udpPending [][]byte
+	udpMu           sync.Mutex
+	udpReady        bool
+	udpPending      [][]byte
+	udpPendingBytes int
 
 	idleMu    sync.Mutex
 	idleTimer *time.Timer
@@ -1360,9 +1368,15 @@ func (sc *ServerConn) queueUDPFromUser(s *Server, data []byte) {
 		sc.resetUDPIdle(s)
 		return
 	}
+	if len(sc.udpPending) >= maxUDPPendingDatagrams ||
+		sc.udpPendingBytes+len(data) > maxUDPPendingBytes {
+		sc.udpMu.Unlock()
+		return
+	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	sc.udpPending = append(sc.udpPending, cp)
+	sc.udpPendingBytes += len(cp)
 	sc.udpMu.Unlock()
 }
 
@@ -1371,6 +1385,7 @@ func (sc *ServerConn) flushUDPPending(s *Server) {
 	sc.udpReady = true
 	pending := sc.udpPending
 	sc.udpPending = nil
+	sc.udpPendingBytes = 0
 	sc.udpMu.Unlock()
 	for _, p := range pending {
 		s.manager.RecordOut(sc.keyHash, len(p))
