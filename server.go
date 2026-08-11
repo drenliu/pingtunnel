@@ -1352,6 +1352,14 @@ func (s *Server) auditInvalidTunnelKey(transport string, hash [16]byte, clientID
 }
 
 func (sc *ServerConn) queueUDPFromUser(s *Server, data []byte) {
+	maxPayload := sc.udpTunnelPayloadLimit(s)
+	if len(data) > maxPayload {
+		// Do not enqueue a datagram the tunnel frame cannot carry. Forwarding a
+		// truncated payload would corrupt UDP; packing failures drop the frame.
+		log.Printf("[server] conn %d: UDP datagram %d bytes exceeds tunnel payload %d, dropping",
+			sc.id, len(data), maxPayload)
+		return
+	}
 	sc.udpMu.Lock()
 	if sc.udpReady {
 		sc.udpMu.Unlock()
@@ -1364,6 +1372,17 @@ func (sc *ServerConn) queueUDPFromUser(s *Server, data []byte) {
 	copy(cp, data)
 	sc.udpPending = append(sc.udpPending, cp)
 	sc.udpMu.Unlock()
+}
+
+// udpTunnelPayloadLimit is the largest UDP datagram that can be carried in one
+// CmdData frame for this session's tunnel transport.
+func (sc *ServerConn) udpTunnelPayloadLimit(s *Server) int {
+	if s.serveDNS {
+		if udpSize := s.dnsUDPSizeForRoute(sc.routeKey); udpSize != 0 {
+			return dnsMaxDataChunk(normQName(s.dnsQName), udpSize, true)
+		}
+	}
+	return MaxPayloadSize
 }
 
 func (sc *ServerConn) flushUDPPending(s *Server) {
