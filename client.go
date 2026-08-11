@@ -493,11 +493,15 @@ func (c *Client) readTarget(cc *ClientConn) {
 		}
 	}()
 
-	chunk := MaxPayloadSize
-	if c.transport == "dns" {
-		chunk = c.dnsMaxDataChunk()
+	maxPayload := c.maxDataPayload()
+	// UDP is message-oriented: a short Read buffer silently truncates datagrams
+	// (n=len(buf), err=nil). Use a full-datagram buffer and drop oversized packets
+	// instead of forwarding corrupted payloads.
+	bufSize := maxPayload
+	if cc.proto == "udp" {
+		bufSize = 65535
 	}
-	buf := make([]byte, chunk)
+	buf := make([]byte, bufSize)
 	for {
 		n, err := cc.tcpConn.Read(buf)
 		if err != nil {
@@ -506,6 +510,11 @@ func (c *Client) readTarget(cc *ClientConn) {
 		if n > 0 {
 			if cc.proto == "udp" {
 				cc.resetUDPIdle(c)
+				if n > maxPayload {
+					log.Printf("[client] conn %d: UDP datagram %d bytes exceeds tunnel payload %d, dropping",
+						cc.id, n, maxPayload)
+					continue
+				}
 			}
 			data := make([]byte, n)
 			copy(data, buf[:n])
@@ -514,6 +523,13 @@ func (c *Client) readTarget(cc *ClientConn) {
 			}
 		}
 	}
+}
+
+func (c *Client) maxDataPayload() int {
+	if c.transport == "dns" {
+		return c.dnsMaxDataChunk()
+	}
+	return MaxPayloadSize
 }
 
 func (c *Client) handleData(pkt *TunnelPacket) {
