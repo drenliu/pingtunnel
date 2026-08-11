@@ -318,9 +318,10 @@ func (c *Client) sender() {
 
 func (c *Client) receiver() {
 	buf := make([]byte, 65535)
+	icmpID := int(c.key[0])<<8 | int(c.key[1])
 	for atomic.LoadInt32(&c.closed) == 0 {
 		c.tunConn.SetReadDeadline(time.Now().Add(time.Second))
-		n, _, err := c.tunConn.ReadFrom(buf)
+		n, addr, err := c.tunConn.ReadFrom(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
@@ -328,6 +329,12 @@ func (c *Client) receiver() {
 			if atomic.LoadInt32(&c.closed) != 0 {
 				return
 			}
+			continue
+		}
+		// KeyHash/ClientID are plaintext on the wire; without peer filtering any host
+		// that observed one client packet can forge MagicResponse commands (CmdConnect
+		// SSRF, CmdData injection, CmdClose, fake restart epoch, etc.).
+		if !tunnelPeerMatch(c.tunPeer, addr) {
 			continue
 		}
 		if c.transport == "dns" {
@@ -353,7 +360,7 @@ func (c *Client) receiver() {
 			continue
 		}
 		echo, ok := msg.Body.(*icmp.Echo)
-		if !ok {
+		if !ok || echo.ID != icmpID {
 			continue
 		}
 		pkt, err := DecodeTunnelPacket(echo.Data)
@@ -364,6 +371,44 @@ func (c *Client) receiver() {
 		if pkt.Flags&FlagMore != 0 {
 			c.enqueue(&TunnelPacket{Cmd: CmdPing})
 		}
+	}
+}
+
+// tunnelPeerMatch reports whether a tunnel response came from the configured server.
+// ICMP compares IP only; DNS also requires the UDP port to match tunPeer.
+func tunnelPeerMatch(expected, got net.Addr) bool {
+	if expected == nil || got == nil {
+		return false
+	}
+	if eu, ok := expected.(*net.UDPAddr); ok {
+		gu, ok := got.(*net.UDPAddr)
+		if !ok || eu.Port != gu.Port {
+			return false
+		}
+		return eu.IP.Equal(gu.IP)
+	}
+	want := addrIP(expected)
+	have := addrIP(got)
+	if want == nil || have == nil {
+		return expected.String() == got.String()
+	}
+	return want.Equal(have)
+}
+
+func addrIP(a net.Addr) net.IP {
+	switch v := a.(type) {
+	case *net.IPAddr:
+		return v.IP
+	case *net.UDPAddr:
+		return v.IP
+	case *net.TCPAddr:
+		return v.IP
+	default:
+		host, _, err := net.SplitHostPort(a.String())
+		if err != nil {
+			return net.ParseIP(a.String())
+		}
+		return net.ParseIP(host)
 	}
 }
 
@@ -715,11 +760,11 @@ func (c *Client) dnsProbeRoundTrip(qname string, udpSize uint16) bool {
 	}
 	buf := make([]byte, 65535)
 	for {
-		n, _, err := c.tunConn.ReadFrom(buf)
+		n, addr, err := c.tunConn.ReadFrom(buf)
 		if err != nil {
 			return false
 		}
-		if n < 12 {
+		if !tunnelPeerMatch(c.tunPeer, addr) || n < 12 {
 			continue
 		}
 		id, payload, err := parseDNSResponse(buf[:n])
