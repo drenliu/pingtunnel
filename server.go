@@ -50,8 +50,12 @@ type Server struct {
 	listenersTCP map[string]net.Listener
 	listenersUDP map[string]*net.UDPConn
 	udpSessions  map[string]*ServerConn // key: listenAddr|remoteUDP
-	connections  map[uint32]*ServerConn
-	nextConnID   uint32
+	// connections is keyed by tunnel identity + ConnID. SOCKS clients pick
+	// ConnIDs from a per-process counter starting at socksConnIDBase; two clients
+	// both use 0x60000001 for their first dial. A map[uint32] made those sessions
+	// overwrite or reject each other.
+	connections map[connMapKey]*ServerConn
+	nextConnID  uint32
 
 	mu        sync.RWMutex
 	closed    int32
@@ -64,6 +68,17 @@ type Server struct {
 		badKey     uint64
 		retransmit uint64
 	}
+}
+
+// connMapKey uniquely identifies a tunnel session on the server.
+type connMapKey struct {
+	keyHash  [16]byte
+	clientID uint32
+	connID   uint32
+}
+
+func makeConnMapKey(keyHash [16]byte, clientID, connID uint32) connMapKey {
+	return connMapKey{keyHash: keyHash, clientID: clientID, connID: connID}
 }
 
 type ServerConn struct {
@@ -91,6 +106,10 @@ type ServerConn struct {
 	idleTimer *time.Timer
 }
 
+func (sc *ServerConn) mapKey() connMapKey {
+	return makeConnMapKey(sc.keyHash, sc.clientID, sc.id)
+}
+
 type ruleTunnelState struct {
 	addr     net.Addr
 	clientID uint32
@@ -116,7 +135,7 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dn
 		listenersTCP:      make(map[string]net.Listener),
 		listenersUDP:      make(map[string]*net.UDPConn),
 		udpSessions:       make(map[string]*ServerConn),
-		connections:       make(map[uint32]*ServerConn),
+		connections:       make(map[connMapKey]*ServerConn),
 		done:              make(chan struct{}),
 		bootEpoch:         bootEpoch,
 		nextConnID:        bootEpoch, // avoid connID reuse across restarts (stale CmdClose); kept < socksConnIDBase
@@ -477,7 +496,7 @@ func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
 
 func (s *Server) handleConnectAck(pkt *TunnelPacket, from net.Addr) {
 	s.mu.RLock()
-	sc := s.connections[pkt.ConnID]
+	sc := s.connections[makeConnMapKey(pkt.KeyHash, pkt.ClientID, pkt.ConnID)]
 	s.mu.RUnlock()
 	if sc != nil && s.matchRoute(sc, from) {
 		sc.readyOnce.Do(func() { close(sc.ready) })
@@ -487,7 +506,7 @@ func (s *Server) handleConnectAck(pkt *TunnelPacket, from net.Addr) {
 
 func (s *Server) handleData(pkt *TunnelPacket, from net.Addr) {
 	s.mu.RLock()
-	sc := s.connections[pkt.ConnID]
+	sc := s.connections[makeConnMapKey(pkt.KeyHash, pkt.ClientID, pkt.ConnID)]
 	s.mu.RUnlock()
 	if sc == nil || len(pkt.Data) == 0 || !s.matchRoute(sc, from) {
 		return
@@ -501,7 +520,7 @@ func (s *Server) handleData(pkt *TunnelPacket, from net.Addr) {
 
 func (s *Server) handleDataAck(pkt *TunnelPacket, from net.Addr) {
 	s.mu.RLock()
-	sc := s.connections[pkt.ConnID]
+	sc := s.connections[makeConnMapKey(pkt.KeyHash, pkt.ClientID, pkt.ConnID)]
 	s.mu.RUnlock()
 	if sc != nil && s.matchRoute(sc, from) {
 		sc.reliSend.Ack(pkt.Seq)
@@ -509,14 +528,15 @@ func (s *Server) handleDataAck(pkt *TunnelPacket, from net.Addr) {
 }
 
 func (s *Server) handleClose(pkt *TunnelPacket, from net.Addr) {
+	ck := makeConnMapKey(pkt.KeyHash, pkt.ClientID, pkt.ConnID)
 	s.mu.Lock()
-	sc, ok := s.connections[pkt.ConnID]
+	sc, ok := s.connections[ck]
 	if ok && !s.matchRoute(sc, from) {
 		s.mu.Unlock()
 		return
 	}
 	if ok {
-		delete(s.connections, pkt.ConnID)
+		delete(s.connections, ck)
 	}
 	s.mu.Unlock()
 	if ok && atomic.CompareAndSwapInt32(&sc.closed, 0, 1) {
@@ -587,8 +607,9 @@ func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {
 		return
 	}
 
+	ck := makeConnMapKey(pkt.KeyHash, pkt.ClientID, pkt.ConnID)
 	s.mu.Lock()
-	if _, exists := s.connections[pkt.ConnID]; exists {
+	if _, exists := s.connections[ck]; exists {
 		s.mu.Unlock()
 		s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
 		return
@@ -621,7 +642,7 @@ func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {
 	)
 
 	s.mu.Lock()
-	s.connections[connID] = sc
+	s.connections[ck] = sc
 	s.mu.Unlock()
 
 	sc.readyOnce.Do(func() { close(sc.ready) })
@@ -849,7 +870,7 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 		)
 
 		s.mu.Lock()
-		s.connections[connID] = sc
+		s.connections[sc.mapKey()] = sc
 		s.mu.Unlock()
 
 		log.Printf("[server] conn %d from %s (route=%s)", connID, tc.RemoteAddr(), routeKey)
@@ -960,7 +981,7 @@ func (s *Server) udpReadLoop(uc *net.UDPConn, listenAddr, targetAddr string, key
 			enk,
 		)
 		s.udpSessions[sessKey] = sc
-		s.connections[connID] = sc
+		s.connections[sc.mapKey()] = sc
 		s.mu.Unlock()
 
 		log.Printf("[server] UDP conn %d from %s (route=%s)", connID, ra.String(), routeKey)
@@ -1048,7 +1069,7 @@ func (s *Server) closeConn(sc *ServerConn) {
 	sc.readyOnce.Do(func() { close(sc.ready) })
 
 	s.mu.Lock()
-	delete(s.connections, sc.id)
+	delete(s.connections, sc.mapKey())
 	if sc.udpSessKey != "" {
 		delete(s.udpSessions, sc.udpSessKey)
 	}
