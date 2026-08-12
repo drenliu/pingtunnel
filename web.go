@@ -189,12 +189,13 @@ func (ws *webServer) apiListKeys(w http.ResponseWriter) {
 	keys := ws.mgr.GetKeys()
 	connsByKey := ws.srv.GetConnsByKey()
 	type ruleWithTunnel struct {
-		ID             string `json:"id"`
-		ListenAddr     string `json:"listen_addr"`
-		TargetAddr     string `json:"target_addr"`
-		Protocol       string `json:"protocol,omitempty"`
-		IcmpOnline     bool   `json:"icmp_online"`
-		IcmpClientAddr string `json:"icmp_client_addr,omitempty"`
+		ID              string `json:"id"`
+		ListenAddr      string `json:"listen_addr"`
+		TargetAddr      string `json:"target_addr"`
+		Protocol        string `json:"protocol,omitempty"`
+		IcmpOnline      bool   `json:"icmp_online"`
+		IcmpClientAddr  string `json:"icmp_client_addr,omitempty"`
+		TunnelTransport string `json:"tunnel_transport,omitempty"`
 	}
 	type keyResp struct {
 		ID       string           `json:"id"`
@@ -218,12 +219,13 @@ func (ws *webServer) apiListKeys(w http.ResponseWriter) {
 		rulesOut := make([]ruleWithTunnel, len(rules))
 		for j, r := range rules {
 			rulesOut[j] = ruleWithTunnel{
-				ID:             r.ID,
-				ListenAddr:     r.ListenAddr,
-				TargetAddr:     r.TargetAddr,
-				Protocol:       r.Protocol,
-				IcmpOnline:     ws.srv.IsRuleTunnelOnline(k.Hash, r),
-				IcmpClientAddr: ws.srv.ICMPClientAddrForRule(k.Hash, r),
+				ID:              r.ID,
+				ListenAddr:      r.ListenAddr,
+				TargetAddr:      r.TargetAddr,
+				Protocol:        r.Protocol,
+				IcmpOnline:      ws.srv.IsRuleTunnelOnline(k.Hash, r),
+				IcmpClientAddr:  ws.srv.ICMPClientAddrForRule(k.Hash, r),
+				TunnelTransport: ws.srv.TunnelTransportForRule(k.Hash, r),
 			}
 		}
 		conns := connsByKey[k.Hash]

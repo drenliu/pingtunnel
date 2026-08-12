@@ -92,10 +92,11 @@ type ServerConn struct {
 }
 
 type ruleTunnelState struct {
-	addr     net.Addr
-	clientID uint32
-	routeKey string
-	lastSeen time.Time
+	addr      net.Addr
+	clientID  uint32
+	routeKey  string
+	transport string // "icmp" or "dns"
+	lastSeen  time.Time
 }
 
 func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dnsUpstream string) *Server {
@@ -291,8 +292,8 @@ func (s *Server) icmpReadLoop(c net.PacketConn) {
 		atomic.AddUint64(&s.stats.tunIn, 1)
 		clientKeyHash := pkt.KeyHash
 		clientID := pkt.ClientID
-		s.handlePacket(pkt, addr)
-		s.noteRuleTunnelICMP(clientKeyHash, clientID, addr)
+		s.handlePacket(pkt, addr, "icmp")
+		s.noteRuleTunnelClient(clientKeyHash, clientID, addr, "icmp")
 		resp := s.dequeueForAddr(clientKeyHash, clientID, addr)
 		resp.Magic = MagicResponse
 		resp.KeyHash = clientKeyHash
@@ -373,8 +374,8 @@ func (s *Server) dnsReadLoop(c net.PacketConn) {
 			udpSize = dnsUDPSizeDefault
 		}
 		s.setDNSRouteUDPSize(routeKey, udpSize)
-		s.handlePacket(pkt, addr)
-		s.noteRuleTunnelICMP(clientKeyHash, clientID, addr)
+		s.handlePacket(pkt, addr, "dns")
+		s.noteRuleTunnelClient(clientKeyHash, clientID, addr, "dns")
 		resp := s.dequeueForAddr(clientKeyHash, clientID, addr)
 		resp.Magic = MagicResponse
 		resp.KeyHash = clientKeyHash
@@ -395,10 +396,10 @@ func (s *Server) dnsReadLoop(c net.PacketConn) {
 
 // --------------- packet handlers ---------------
 
-func (s *Server) handlePacket(pkt *TunnelPacket, from net.Addr) {
+func (s *Server) handlePacket(pkt *TunnelPacket, from net.Addr, transport string) {
 	switch pkt.Cmd {
 	case CmdSetup:
-		s.handleSetup(pkt, from)
+		s.handleSetup(pkt, from, transport)
 	case CmdConnectAck:
 		s.handleConnectAck(pkt, from)
 	case CmdData:
@@ -410,11 +411,11 @@ func (s *Server) handlePacket(pkt *TunnelPacket, from net.Addr) {
 	case CmdSocksDial:
 		s.handleSocksDial(pkt, from)
 	case CmdSocksRegister:
-		s.handleSocksRegister(pkt, from)
+		s.handleSocksRegister(pkt, from, transport)
 	}
 }
 
-func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
+func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr, transport string) {
 	parts := bytes.Split(pkt.Data, []byte("|"))
 	if len(parts) < 2 {
 		log.Println("[server] bad setup payload")
@@ -461,17 +462,18 @@ func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr) {
 	}
 	_, _, wasOnline := s.routeKeyForListener(pkt.KeyHash, mapKey)
 	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck, Data: s.setupAckPayload()})
-	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, mapKey, from)
+	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, mapKey, from, transport)
 	if !wasOnline {
 		Audit("tunnel.client.online", mergeFields(auditKeyFields(s.manager, pkt.KeyHash), map[string]string{
 			"listen_addr": listenAddr,
 			"target_addr": targetAddr,
 			"protocol":    protocol,
+			"transport":   normalizeClientTransport(transport),
 			"client_addr": addrString(from),
 			"client_id":   fmt.Sprintf("%08x", pkt.ClientID),
 			"result":      "ok",
 		}))
-		log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s", listenAddr, targetAddr, protocol)
+		log.Printf("[server] tunnel setup: listen=%s target=%s proto=%s transport=%s", listenAddr, targetAddr, protocol, normalizeClientTransport(transport))
 	}
 }
 
@@ -536,7 +538,7 @@ func (s *Server) handleClose(pkt *TunnelPacket, from net.Addr) {
 	}
 }
 
-func (s *Server) handleSocksRegister(pkt *TunnelPacket, from net.Addr) {
+func (s *Server) handleSocksRegister(pkt *TunnelPacket, from net.Addr, transport string) {
 	if !s.socksDynamic {
 		Audit("socks.register.rejected", mergeFields(auditKeyFields(s.manager, pkt.KeyHash), map[string]string{
 			"client_addr": addrString(from),
@@ -550,9 +552,9 @@ func (s *Server) handleSocksRegister(pkt *TunnelPacket, from net.Addr) {
 	}
 	_, _, wasOnline := s.routeKeyForListener(pkt.KeyHash, "socks-dynamic")
 	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck, Data: s.setupAckPayload()})
-	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, "socks-dynamic", from)
+	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, "socks-dynamic", from, transport)
 	if !wasOnline {
-		log.Printf("[server] SOCKS dynamic forwarding registered for tunnel key")
+		log.Printf("[server] SOCKS dynamic forwarding registered for tunnel key (transport=%s)", normalizeClientTransport(transport))
 	}
 }
 
@@ -1089,7 +1091,7 @@ func ruleTunnelMapKey(keyHash [16]byte, listenerMapKey string) string {
 	return hex.EncodeToString(keyHash[:]) + "|" + listenerMapKey
 }
 
-func (s *Server) registerRuleTunnelClient(keyHash [16]byte, clientID uint32, listenerMapKey string, from net.Addr) {
+func (s *Server) registerRuleTunnelClient(keyHash [16]byte, clientID uint32, listenerMapKey string, from net.Addr, transport string) {
 	if from == nil {
 		return
 	}
@@ -1098,17 +1100,19 @@ func (s *Server) registerRuleTunnelClient(keyHash [16]byte, clientID uint32, lis
 	if qk == "" {
 		return
 	}
+	transport = normalizeClientTransport(transport)
 	s.ruleTunnelMu.Lock()
-	s.ruleTunnelClients[k] = &ruleTunnelState{addr: from, clientID: clientID, routeKey: qk, lastSeen: time.Now()}
+	s.ruleTunnelClients[k] = &ruleTunnelState{addr: from, clientID: clientID, routeKey: qk, transport: transport, lastSeen: time.Now()}
 	s.ruleTunnelMu.Unlock()
 }
 
-func (s *Server) noteRuleTunnelICMP(keyHash [16]byte, clientID uint32, from net.Addr) {
+func (s *Server) noteRuleTunnelClient(keyHash [16]byte, clientID uint32, from net.Addr, transport string) {
 	if from == nil {
 		return
 	}
 	prefix := hex.EncodeToString(keyHash[:]) + "|"
 	now := time.Now()
+	transport = normalizeClientTransport(transport)
 	s.ruleTunnelMu.Lock()
 	for mapKey, st := range s.ruleTunnelClients {
 		if st == nil || st.addr == nil {
@@ -1122,10 +1126,12 @@ func (s *Server) noteRuleTunnelICMP(keyHash [16]byte, clientID uint32, from net.
 				continue
 			}
 			st.lastSeen = now
+			st.transport = transport
 			continue
 		}
 		if st.addr.String() == from.String() {
 			st.lastSeen = now
+			st.transport = transport
 		}
 	}
 	s.ruleTunnelMu.Unlock()
@@ -1135,7 +1141,7 @@ func (s *Server) ruleListenMapKey(r *ForwardRule) string {
 	return ListenerMapKey(normalizeProtocol(r.Protocol), r.ListenAddr)
 }
 
-// IsRuleTunnelOnline is true when this rule's listen port has a tunnel client sending ICMP recently.
+// IsRuleTunnelOnline is true when this rule's listen port has a tunnel client sending recently.
 func (s *Server) IsRuleTunnelOnline(keyHash [16]byte, r *ForwardRule) bool {
 	k := ruleTunnelMapKey(keyHash, s.ruleListenMapKey(r))
 	s.ruleTunnelMu.Lock()
@@ -1149,7 +1155,7 @@ func (s *Server) IsRuleTunnelOnline(keyHash [16]byte, r *ForwardRule) bool {
 	return on
 }
 
-// ICMPClientAddrForRule returns the ICMP source seen for this listen rule, or "" if offline.
+// ICMPClientAddrForRule returns the tunnel client source for this listen rule, or "" if offline.
 func (s *Server) ICMPClientAddrForRule(keyHash [16]byte, r *ForwardRule) string {
 	k := ruleTunnelMapKey(keyHash, s.ruleListenMapKey(r))
 	s.ruleTunnelMu.Lock()
@@ -1161,6 +1167,20 @@ func (s *Server) ICMPClientAddrForRule(keyHash [16]byte, r *ForwardRule) string 
 	a := st.addr.String()
 	s.ruleTunnelMu.Unlock()
 	return a
+}
+
+// TunnelTransportForRule returns "icmp" or "dns" for an online tunnel client, or "" if offline.
+func (s *Server) TunnelTransportForRule(keyHash [16]byte, r *ForwardRule) string {
+	k := ruleTunnelMapKey(keyHash, s.ruleListenMapKey(r))
+	s.ruleTunnelMu.Lock()
+	st, ok := s.ruleTunnelClients[k]
+	if !ok || st == nil || st.addr == nil || time.Since(st.lastSeen) > icmpClientHeartbeatTTL {
+		s.ruleTunnelMu.Unlock()
+		return ""
+	}
+	tr := st.transport
+	s.ruleTunnelMu.Unlock()
+	return normalizeClientTransport(tr)
 }
 
 func (s *Server) pruneStaleICMPPeers() {
