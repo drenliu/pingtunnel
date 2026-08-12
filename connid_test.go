@@ -84,7 +84,7 @@ func TestSocksDialRejectsServerConnIDSpace(t *testing.T) {
 		closed:   1, // already closed marker so cleanup is quiet
 	}
 	s.mu.Lock()
-	s.connections[serverConnID] = sc
+	s.connections[sc.mapKey()] = sc
 	s.mu.Unlock()
 
 	s.handleSocksDial(&TunnelPacket{
@@ -96,7 +96,7 @@ func TestSocksDialRejectsServerConnIDSpace(t *testing.T) {
 
 	// Low-ID SOCKS dial must be rejected without replacing the existing connection.
 	s.mu.RLock()
-	got := s.connections[serverConnID]
+	got := s.connections[sc.mapKey()]
 	s.mu.RUnlock()
 	if got != sc {
 		t.Fatal("SOCKS dial with server-space ConnID overwrote an existing connection")
