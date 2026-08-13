@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -143,13 +144,22 @@ func (rr *ReliableRecv) Receive(seq uint32, data []byte) error {
 		return nil
 	}
 
-	rr.ack(&TunnelPacket{Cmd: CmdDataAck, ConnID: rr.connID, Seq: seq})
-
 	if seq < rr.nextSeq {
+		// Duplicate/old: ACK so the peer can clear its send window.
+		rr.ack(&TunnelPacket{Cmd: CmdDataAck, ConnID: rr.connID, Seq: seq})
 		rr.mu.Unlock()
 		return nil
 	}
 	if seq > rr.nextSeq {
+		// Cap the reorder gap to the send window. Without this, a peer that
+		// never sends nextSeq can grow rr.buf without bound (OOM).
+		if seq-rr.nextSeq >= maxUnacked {
+			next := rr.nextSeq
+			buffered := len(rr.buf)
+			rr.mu.Unlock()
+			return fmt.Errorf("reliable recv: reorder window exceeded (seq=%d next=%d buffered=%d)", seq, next, buffered)
+		}
+		rr.ack(&TunnelPacket{Cmd: CmdDataAck, ConnID: rr.connID, Seq: seq})
 		if _, ok := rr.buf[seq]; !ok {
 			tmp := make([]byte, len(data))
 			copy(tmp, data)
@@ -160,6 +170,7 @@ func (rr *ReliableRecv) Receive(seq uint32, data []byte) error {
 	}
 
 	// seq == nextSeq — collect contiguous run for delivery.
+	rr.ack(&TunnelPacket{Cmd: CmdDataAck, ConnID: rr.connID, Seq: seq})
 	var batch [][]byte
 	batch = append(batch, data)
 	rr.nextSeq++
