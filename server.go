@@ -461,8 +461,22 @@ func (s *Server) handleSetup(pkt *TunnelPacket, from net.Addr, transport string)
 		}
 	}
 	_, _, wasOnline := s.routeKeyForListener(pkt.KeyHash, mapKey)
+	// Register before SetupAck so a second client sharing the same key+listen
+	// cannot be told "ready" while stealing (or flapping) the accept route.
+	if !s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, mapKey, from, transport) {
+		Audit("tunnel.setup.rejected", mergeFields(auditKeyFields(s.manager, pkt.KeyHash), map[string]string{
+			"listen_addr": listenAddr,
+			"target_addr": targetAddr,
+			"protocol":    protocol,
+			"client_addr": addrString(from),
+			"client_id":   fmt.Sprintf("%08x", pkt.ClientID),
+			"result":      "denied",
+			"detail":      "listen route owned by another online client",
+		}))
+		log.Printf("[server] setup deferred: %s already has an online tunnel client for this key", mapKey)
+		return
+	}
 	s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdSetupAck, Data: s.setupAckPayload()})
-	s.registerRuleTunnelClient(pkt.KeyHash, pkt.ClientID, mapKey, from, transport)
 	if !wasOnline {
 		Audit("tunnel.client.online", mergeFields(auditKeyFields(s.manager, pkt.KeyHash), map[string]string{
 			"listen_addr": listenAddr,
@@ -1091,19 +1105,38 @@ func ruleTunnelMapKey(keyHash [16]byte, listenerMapKey string) string {
 	return hex.EncodeToString(keyHash[:]) + "|" + listenerMapKey
 }
 
-func (s *Server) registerRuleTunnelClient(keyHash [16]byte, clientID uint32, listenerMapKey string, from net.Addr, transport string) {
+// registerRuleTunnelClient binds a listen rule (or socks-dynamic) to a tunnel client.
+// For port-forward listens, an online owner with a different ClientID is sticky:
+// periodic Setup from another client must not overwrite the route (that flapped
+// new accepts between machines sharing a key). Returns false when registration
+// is refused; caller must not CmdSetupAck in that case.
+// socks-dynamic allows multiple clients per key (dials use per-client queues),
+// so those registrations always succeed.
+func (s *Server) registerRuleTunnelClient(keyHash [16]byte, clientID uint32, listenerMapKey string, from net.Addr, transport string) bool {
 	if from == nil {
-		return
+		return false
 	}
 	k := ruleTunnelMapKey(keyHash, listenerMapKey)
 	qk := s.queueKeyForAddr(keyHash, clientID, from)
 	if qk == "" {
-		return
+		return false
 	}
 	transport = normalizeClientTransport(transport)
+	now := time.Now()
 	s.ruleTunnelMu.Lock()
-	s.ruleTunnelClients[k] = &ruleTunnelState{addr: from, clientID: clientID, routeKey: qk, transport: transport, lastSeen: time.Now()}
-	s.ruleTunnelMu.Unlock()
+	defer s.ruleTunnelMu.Unlock()
+	if listenerMapKey != "socks-dynamic" {
+		if existing, ok := s.ruleTunnelClients[k]; ok && existing != nil {
+			otherOnline := existing.clientID != 0 &&
+				existing.clientID != clientID &&
+				now.Sub(existing.lastSeen) <= icmpClientHeartbeatTTL
+			if otherOnline {
+				return false
+			}
+		}
+	}
+	s.ruleTunnelClients[k] = &ruleTunnelState{addr: from, clientID: clientID, routeKey: qk, transport: transport, lastSeen: now}
+	return true
 }
 
 func (s *Server) noteRuleTunnelClient(keyHash [16]byte, clientID uint32, from net.Addr, transport string) {
