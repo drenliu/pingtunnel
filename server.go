@@ -1375,9 +1375,13 @@ func (sc *ServerConn) queueUDPFromUser(s *Server, data []byte) {
 	sc.udpMu.Lock()
 	if sc.udpReady {
 		sc.udpMu.Unlock()
-		s.manager.RecordOut(sc.keyHash, len(data))
-		sc.reliSend.Send(data)
-		sc.resetUDPIdle(s)
+		// Non-blocking: udpReadLoop is shared across all sessions on this
+		// listen port. Blocking ReliableSend.Send here stalls every peer when
+		// the reliable window is full (lossy tunnel / slow client).
+		if sc.reliSend.TrySend(data) {
+			s.manager.RecordOut(sc.keyHash, len(data))
+			sc.resetUDPIdle(s)
+		}
 		return
 	}
 	cp := make([]byte, len(data))

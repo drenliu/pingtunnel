@@ -3,6 +3,7 @@ package main
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestReliableSendSendAndAck(t *testing.T) {
@@ -96,5 +97,77 @@ func TestReliableRecvDuplicateIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("duplicate seq should not deliver again, n=%d", n)
+	}
+}
+
+func TestReliableSendTrySendWindowFull(t *testing.T) {
+	var mu sync.Mutex
+	var out []*TunnelPacket
+	enq := func(p *TunnelPacket) {
+		mu.Lock()
+		out = append(out, p)
+		mu.Unlock()
+	}
+	rs := NewReliableSend(42, enq)
+	for i := 0; i < maxUnacked; i++ {
+		if !rs.TrySend([]byte{byte(i)}) {
+			t.Fatalf("TrySend %d failed before window full", i)
+		}
+	}
+	if rs.TrySend([]byte("overflow")) {
+		t.Fatal("TrySend should fail when in-flight window is full")
+	}
+	if rs.PendingCount() != maxUnacked {
+		t.Fatalf("pending %d, want %d", rs.PendingCount(), maxUnacked)
+	}
+	rs.Ack(1)
+	if !rs.TrySend([]byte("after-ack")) {
+		t.Fatal("TrySend should succeed after an Ack frees a window slot")
+	}
+	rs.Close()
+	if rs.TrySend([]byte("closed")) {
+		t.Fatal("TrySend after Close should fail")
+	}
+}
+
+func TestQueueUDPFromUserDoesNotBlockWhenWindowFull(t *testing.T) {
+	mgr := NewManager("")
+	s := NewServer(mgr, false, "dns", ":0", "c.pingt.local", "")
+	defer s.Close()
+
+	var enqN int
+	rs := NewReliableSend(99, func(*TunnelPacket) { enqN++ })
+	// Fill the reliable window so a blocking Send would spin forever (no Acks).
+	for i := 0; i < maxUnacked; i++ {
+		if !rs.TrySend([]byte{byte(i)}) {
+			t.Fatalf("setup TrySend %d failed", i)
+		}
+	}
+
+	sc := &ServerConn{
+		id:       99,
+		proto:    "udp",
+		keyHash:  ComputeKeyHash("k"),
+		udpReady: true,
+		reliSend: rs,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		sc.queueUDPFromUser(s, []byte("datagram-should-drop"))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok: returned without blocking on Send
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("queueUDPFromUser blocked while reliable send window was full")
+	}
+	if rs.PendingCount() != maxUnacked {
+		t.Fatalf("pending changed to %d; oversized datagram should be dropped", rs.PendingCount())
+	}
+	if enqN != maxUnacked {
+		t.Fatalf("enqueued %d, want %d (no extra packet on drop)", enqN, maxUnacked)
 	}
 }

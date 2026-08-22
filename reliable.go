@@ -63,6 +63,25 @@ func (rs *ReliableSend) Send(data []byte) bool {
 	return true
 }
 
+// TrySend is a non-blocking Send. It returns false if the sender is closed or
+// the in-flight window is full (caller should drop or retry later).
+// UDP listen loops must use this so a stalled tunnel cannot block reads for
+// every session on the shared UDP socket.
+func (rs *ReliableSend) TrySend(data []byte) bool {
+	rs.mu.Lock()
+	if rs.closed || len(rs.pending) >= maxUnacked {
+		rs.mu.Unlock()
+		return false
+	}
+	seq := rs.nextSeq
+	rs.nextSeq++
+	rs.pending[seq] = &sendEntry{seq: seq, data: data, sentAt: time.Now()}
+	rs.mu.Unlock()
+
+	rs.enqueue(&TunnelPacket{Cmd: CmdData, ConnID: rs.connID, Seq: seq, Data: data})
+	return true
+}
+
 func (rs *ReliableSend) Ack(seq uint32) {
 	rs.mu.Lock()
 	delete(rs.pending, seq)
