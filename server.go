@@ -21,6 +21,12 @@ import (
 // icmpClientHeartbeatTTL: if no ICMP from a tunnel key for this long, treat client as offline.
 const icmpClientHeartbeatTTL = 45 * time.Second
 
+// maxSendQueues caps per-route outbound queues. enqueueForAddr keys queues by
+// keyHash|clientID; without a cap, Setup/SOCKS register with rotating ClientIDs
+// would allocate unbounded buffered channels (OOM).
+const maxSendQueues = 4096
+const sendQueueBuffer = 4096
+
 type Server struct {
 	manager *Manager
 	// At most one of these may be nil. Both may be set when the server uses ICMP+DNS.
@@ -1192,6 +1198,49 @@ func (s *Server) pruneStaleICMPPeers() {
 		}
 	}
 	s.ruleTunnelMu.Unlock()
+	s.pruneOrphanRouteState()
+}
+
+// liveRouteKeys returns route keys still referenced by an online tunnel client
+// registration or an active connection (so their send queues must be kept).
+func (s *Server) liveRouteKeys() map[string]bool {
+	live := make(map[string]bool)
+	s.ruleTunnelMu.Lock()
+	for _, st := range s.ruleTunnelClients {
+		if st != nil && st.routeKey != "" {
+			live[st.routeKey] = true
+		}
+	}
+	s.ruleTunnelMu.Unlock()
+	s.mu.RLock()
+	for _, sc := range s.connections {
+		if sc != nil && sc.routeKey != "" {
+			live[sc.routeKey] = true
+		}
+	}
+	s.mu.RUnlock()
+	return live
+}
+
+// pruneOrphanRouteState drops sendQueues / dnsRouteUDPSize entries whose route
+// keys are no longer referenced. Channels are not closed (avoid send/recv races);
+// unreferenced channels are GC'd.
+func (s *Server) pruneOrphanRouteState() {
+	live := s.liveRouteKeys()
+	s.sendQueuesMu.Lock()
+	for k := range s.sendQueues {
+		if !live[k] {
+			delete(s.sendQueues, k)
+		}
+	}
+	s.sendQueuesMu.Unlock()
+	s.dnsRouteUDPSizeMu.Lock()
+	for k := range s.dnsRouteUDPSize {
+		if !live[k] {
+			delete(s.dnsRouteUDPSize, k)
+		}
+	}
+	s.dnsRouteUDPSizeMu.Unlock()
 }
 
 // --------------- background loops ---------------
@@ -1219,6 +1268,7 @@ func (s *Server) statsLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			s.pruneStaleICMPPeers()
 			in := atomic.LoadUint64(&s.stats.tunIn)
 			out := atomic.LoadUint64(&s.stats.tunOut)
 			bad := atomic.LoadUint64(&s.stats.badKey)
@@ -1253,8 +1303,22 @@ func (s *Server) enqueueRoute(routeKey string, pkt *TunnelPacket) {
 	s.sendQueuesMu.Lock()
 	ch := s.sendQueues[routeKey]
 	if ch == nil {
-		ch = make(chan *TunnelPacket, 4096)
-		s.sendQueues[routeKey] = ch
+		if len(s.sendQueues) >= maxSendQueues {
+			s.sendQueuesMu.Unlock()
+			s.pruneOrphanRouteState()
+			s.sendQueuesMu.Lock()
+			ch = s.sendQueues[routeKey]
+			if ch == nil && len(s.sendQueues) >= maxSendQueues {
+				s.sendQueuesMu.Unlock()
+				log.Printf("[server] send queue limit (%d) reached, dropping cmd=%d route=%s",
+					maxSendQueues, pkt.Cmd, routeKey)
+				return
+			}
+		}
+		if ch == nil {
+			ch = make(chan *TunnelPacket, sendQueueBuffer)
+			s.sendQueues[routeKey] = ch
+		}
 	}
 	s.sendQueuesMu.Unlock()
 	select {
@@ -1280,6 +1344,9 @@ func (s *Server) dequeueRoute(routeKey string) *TunnelPacket {
 	}
 	select {
 	case resp := <-ch:
+		if resp == nil {
+			return &TunnelPacket{Cmd: CmdPing}
+		}
 		if len(ch) > 0 {
 			resp.Flags |= FlagMore
 		}
