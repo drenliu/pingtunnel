@@ -118,6 +118,7 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 
 	ch := make(chan bool, 1)
 	connID := atomic.AddUint32(&c.nextSocksConn, 1) + socksConnIDBase
+	gen := atomic.LoadUint32(&c.sessionGen)
 
 	c.socksMu.Lock()
 	c.socksWait[connID] = ch
@@ -144,6 +145,12 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 		_, _ = tc.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0}) // connection refused
 		return
 	}
+	// Server restart may have reset sessions while DialAck was in flight.
+	if atomic.LoadUint32(&c.sessionGen) != gen {
+		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: connID})
+		_, _ = tc.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
 	if _, err := tc.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: connID})
 		return
@@ -158,6 +165,13 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 	)
 
 	c.mu.Lock()
+	if atomic.LoadUint32(&c.sessionGen) != gen {
+		c.mu.Unlock()
+		cc.reliSend.Close()
+		cc.reliRecv.Close()
+		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: connID})
+		return
+	}
 	c.connections[connID] = cc
 	c.mu.Unlock()
 
