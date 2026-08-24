@@ -48,6 +48,7 @@ type Client struct {
 	tunSeq      uint32
 	dnsUDPSize  uint32 // atomic: negotiated EDNS UDP payload size (DNS transport)
 	serverEpoch uint32 // atomic: last seen server boot epoch (detect restart)
+	sessionGen  uint32 // atomic: bumped on server-restart reset; cancels in-flight dials
 	mu          sync.RWMutex
 	closed      int32
 	done        chan struct{}
@@ -425,6 +426,7 @@ func (c *Client) handleConnect(pkt *TunnelPacket) {
 		return
 	}
 	c.pending[pkt.ConnID] = true
+	gen := atomic.LoadUint32(&c.sessionGen)
 	c.mu.Unlock()
 	if stale != nil {
 		c.closeClientConn(stale, true)
@@ -445,9 +447,12 @@ func (c *Client) handleConnect(pkt *TunnelPacket) {
 	if err != nil {
 		log.Printf("[client] conn %d: dial failed: %v", pkt.ConnID, err)
 		c.mu.Lock()
+		cancelled := gen != atomic.LoadUint32(&c.sessionGen) || !c.pending[pkt.ConnID]
 		delete(c.pending, pkt.ConnID)
 		c.mu.Unlock()
-		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		if !cancelled {
+			c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		}
 		return
 	}
 
@@ -465,6 +470,15 @@ func (c *Client) handleConnect(pkt *TunnelPacket) {
 	)
 
 	c.mu.Lock()
+	// Server restart clears pending via a new map and bumps sessionGen. An in-flight
+	// dial must not reinstall a ghost session (or overwrite a post-restart ConnID).
+	if gen != atomic.LoadUint32(&c.sessionGen) || !c.pending[pkt.ConnID] {
+		c.mu.Unlock()
+		conn.Close()
+		cc.reliSend.Close()
+		cc.reliRecv.Close()
+		return
+	}
 	delete(c.pending, pkt.ConnID)
 	c.connections[pkt.ConnID] = cc
 	c.mu.Unlock()
@@ -744,6 +758,22 @@ func (c *Client) enqueueSetupRefresh() {
 }
 
 func (c *Client) resetTunnelSessions() {
+	atomic.AddUint32(&c.sessionGen, 1)
+
+	c.socksMu.Lock()
+	var waiters []chan bool
+	for id, ch := range c.socksWait {
+		waiters = append(waiters, ch)
+		delete(c.socksWait, id)
+	}
+	c.socksMu.Unlock()
+	for _, ch := range waiters {
+		select {
+		case ch <- false:
+		default:
+		}
+	}
+
 	c.mu.Lock()
 	var conns []*ClientConn
 	for id, cc := range c.connections {
