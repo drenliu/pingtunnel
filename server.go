@@ -38,8 +38,9 @@ type Server struct {
 	// socksDynamic: when true, accept CmdSocksDial / CmdSocksRegister from clients.
 	socksDynamic bool
 
-	// Per-tunnel-endpoint outbound queue: key hash + tunnel peer address.
-	// This prevents cross-talk when multiple clients share the same tunnel key.
+	// Per-tunnel-endpoint outbound queue: key hash + clientID + peer IP.
+	// ClientID demuxes clients behind the same NAT; peer IP prevents a second
+	// host from spoofing ClientID and stealing another client's outbound frames.
 	sendQueues   map[string]chan *TunnelPacket
 	sendQueuesMu sync.Mutex
 
@@ -1322,15 +1323,41 @@ func (s *Server) clearDNSRouteUDPSizePrefix(prefix string) {
 	s.dnsRouteUDPSizeMu.Unlock()
 }
 
-func (s *Server) queueKeyForAddr(keyHash [16]byte, clientID uint32, addr net.Addr) string {
-	prefix := hex.EncodeToString(keyHash[:]) + "|"
-	if clientID != 0 {
-		return prefix + fmt.Sprintf("cid:%08x", clientID)
-	}
+// peerIPString returns a stable IP-only key for tunnel peer demux (no UDP port),
+// so a DNS client keeps the same route if the kernel briefly remaps the port.
+func peerIPString(addr net.Addr) string {
 	if addr == nil {
 		return ""
 	}
-	return prefix + "addr:" + addr.String()
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		if a.IP != nil {
+			return a.IP.String()
+		}
+	case *net.IPAddr:
+		if a.IP != nil {
+			return a.IP.String()
+		}
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err == nil {
+		return host
+	}
+	return addr.String()
+}
+
+func (s *Server) queueKeyForAddr(keyHash [16]byte, clientID uint32, addr net.Addr) string {
+	prefix := hex.EncodeToString(keyHash[:]) + "|"
+	ip := peerIPString(addr)
+	if ip == "" {
+		return ""
+	}
+	if clientID != 0 {
+		// Bind both ClientID and peer IP: ClientID alone is plaintext on the wire
+		// and was forgeable from any address (cross-client queue theft).
+		return prefix + fmt.Sprintf("cid:%08x|ip:%s", clientID, ip)
+	}
+	return prefix + "ip:" + ip
 }
 
 func (s *Server) routeKeyForListener(keyHash [16]byte, listenerMapKey string) (string, uint32, bool) {
