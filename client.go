@@ -445,9 +445,13 @@ func (c *Client) handleConnect(pkt *TunnelPacket) {
 	if err != nil {
 		log.Printf("[client] conn %d: dial failed: %v", pkt.ConnID, err)
 		c.mu.Lock()
+		// CmdClose during dial clears pending; do not emit another Close (ConnID may be reused).
+		cancelled := !c.pending[pkt.ConnID]
 		delete(c.pending, pkt.ConnID)
 		c.mu.Unlock()
-		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		if !cancelled {
+			c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+		}
 		return
 	}
 
@@ -465,6 +469,16 @@ func (c *Client) handleConnect(pkt *TunnelPacket) {
 	)
 
 	c.mu.Lock()
+	// Server may have sent CmdClose while DialTimeout was in flight (rule restart,
+	// connect timeout, etc.). pending is cleared by handleCloseCmd in that case —
+	// do not reinstall a ghost session or ConnectAck a dead server conn.
+	if !c.pending[pkt.ConnID] {
+		c.mu.Unlock()
+		conn.Close()
+		cc.reliSend.Close()
+		cc.reliRecv.Close()
+		return
+	}
 	delete(c.pending, pkt.ConnID)
 	c.connections[pkt.ConnID] = cc
 	c.mu.Unlock()
@@ -559,6 +573,9 @@ func (c *Client) handleCloseCmd(pkt *TunnelPacket) {
 	}
 
 	c.mu.Lock()
+	// Cancel an in-flight CmdConnect dial so it cannot install a ghost session
+	// after the server has already torn down this ConnID.
+	delete(c.pending, pkt.ConnID)
 	cc, ok := c.connections[pkt.ConnID]
 	if ok {
 		delete(c.connections, pkt.ConnID)
