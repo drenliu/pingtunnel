@@ -120,6 +120,7 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 	connID := atomic.AddUint32(&c.nextSocksConn, 1) + socksConnIDBase
 
 	c.socksMu.Lock()
+	delete(c.socksCancel, connID) // clear stale cancel if ConnID ever wraps
 	c.socksWait[connID] = ch
 	c.socksMu.Unlock()
 
@@ -131,24 +132,25 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 	case <-time.After(25 * time.Second):
 		c.socksMu.Lock()
 		delete(c.socksWait, connID)
+		delete(c.socksCancel, connID)
 		c.socksMu.Unlock()
 		ok = false
 	case <-c.done:
 		c.socksMu.Lock()
 		delete(c.socksWait, connID)
+		delete(c.socksCancel, connID)
 		c.socksMu.Unlock()
 		return
 	}
 
 	if !ok {
+		c.socksMu.Lock()
+		delete(c.socksWait, connID)
+		delete(c.socksCancel, connID)
+		c.socksMu.Unlock()
 		_, _ = tc.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0}) // connection refused
 		return
 	}
-	if _, err := tc.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
-		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: connID})
-		return
-	}
-	_ = tc.SetDeadline(time.Time{})
 
 	cc := &ClientConn{id: connID, proto: "tcp", tcpConn: tc}
 	cc.reliSend = NewReliableSend(connID, c.enqueue)
@@ -157,9 +159,35 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 		c.enqueue,
 	)
 
+	// Install under socksMu so CmdClose either cancels before insert or finds the
+	// connection afterward — never neither (DialAck-then-Close race → ghost relay).
+	c.socksMu.Lock()
+	cancelled := c.socksCancel[connID]
+	delete(c.socksCancel, connID)
+	delete(c.socksWait, connID)
+	if cancelled {
+		c.socksMu.Unlock()
+		cc.reliSend.Close()
+		cc.reliRecv.Close()
+		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: connID})
+		_, _ = tc.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
 	c.mu.Lock()
 	c.connections[connID] = cc
 	c.mu.Unlock()
+	c.socksMu.Unlock()
+
+	if _, err := tc.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: connID})
+		c.mu.Lock()
+		delete(c.connections, connID)
+		c.mu.Unlock()
+		cc.reliSend.Close()
+		cc.reliRecv.Close()
+		return
+	}
+	_ = tc.SetDeadline(time.Time{})
 
 	// Must not return here: defer tc.Close() would reset the SOCKS client while
 	// the tunnel relay is still active. serveSOCKSConn already runs in its own goroutine.

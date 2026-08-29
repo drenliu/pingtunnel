@@ -42,6 +42,7 @@ type Client struct {
 	socksListener net.Listener
 	socksLnMu     sync.Mutex
 	socksWait     map[uint32]chan bool
+	socksCancel   map[uint32]bool // ConnID cancelled by CmdClose before relay install
 	socksMu       sync.Mutex
 	nextSocksConn uint32
 
@@ -81,6 +82,7 @@ func NewClient(listenAddr, serverAddr, targetAddr, key, protocol, socksAddr, tra
 		connections: make(map[uint32]*ClientConn),
 		pending:     make(map[uint32]bool),
 		socksWait:   make(map[uint32]chan bool),
+		socksCancel: make(map[uint32]bool),
 		sendQueue:   make(chan *TunnelPacket, 4096),
 		done:        make(chan struct{}),
 		setupDone:   make(chan struct{}),
@@ -547,6 +549,9 @@ func (c *Client) handleDataAck(pkt *TunnelPacket) {
 
 func (c *Client) handleCloseCmd(pkt *TunnelPacket) {
 	c.socksMu.Lock()
+	// Mark cancelled so serveSOCKSConn cannot install a ghost relay if CmdClose
+	// arrives after DialAck woke the waiter but before connections[connID] is set.
+	c.socksCancel[pkt.ConnID] = true
 	if ch, wk := c.socksWait[pkt.ConnID]; wk {
 		delete(c.socksWait, pkt.ConnID)
 		c.socksMu.Unlock()
