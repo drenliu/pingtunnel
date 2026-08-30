@@ -67,21 +67,22 @@ type Server struct {
 }
 
 type ServerConn struct {
-	id         uint32
-	proto      string // "tcp" or "udp"
-	tcpConn    net.Conn
-	udpSock    *net.UDPConn
-	udpRemote  *net.UDPAddr
-	udpSessKey string
-	targetAddr string
-	keyHash    [16]byte
-	clientID   uint32
-	routeKey   string
-	closed     int32
-	ready      chan struct{}
-	readyOnce  sync.Once
-	reliSend   *ReliableSend
-	reliRecv   *ReliableRecv
+	id           uint32
+	proto        string // "tcp" or "udp"
+	tcpConn      net.Conn
+	udpSock      *net.UDPConn
+	udpRemote    *net.UDPAddr
+	udpSessKey   string
+	listenMapKey string // ListenerMapKey for port-forward; empty for SOCKS
+	targetAddr   string
+	keyHash      [16]byte
+	clientID     uint32
+	routeKey     string
+	closed       int32
+	ready        chan struct{}
+	readyOnce    sync.Once
+	reliSend     *ReliableSend
+	reliRecv     *ReliableRecv
 
 	udpMu      sync.Mutex
 	udpReady   bool
@@ -733,7 +734,9 @@ func (s *Server) RestartListenersAfterRuleChange(keyHash [16]byte, oldMapKey, ne
 	}
 	var toClose []*ServerConn
 	for _, sc := range s.connections {
-		if sc.keyHash == keyHash {
+		// Only tear down sessions bound to the restarted listener(s).
+		// SOCKS (empty listenMapKey) and other port-forwards for this key must survive.
+		if sc.keyHash == keyHash && sc.listenMapKey != "" && affected[sc.listenMapKey] {
 			toClose = append(toClose, sc)
 		}
 	}
@@ -834,14 +837,15 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 			continue
 		}
 		sc := &ServerConn{
-			id:         connID,
-			proto:      "tcp",
-			tcpConn:    tc,
-			targetAddr: targetAddr,
-			keyHash:    keyHash,
-			clientID:   clientID,
-			routeKey:   routeKey,
-			ready:      make(chan struct{}),
+			id:           connID,
+			proto:        "tcp",
+			tcpConn:      tc,
+			listenMapKey: mapKey,
+			targetAddr:   targetAddr,
+			keyHash:      keyHash,
+			clientID:     clientID,
+			routeKey:     routeKey,
+			ready:        make(chan struct{}),
 		}
 		enk := s.makeEnqueueRoute(routeKey)
 		sc.reliSend = NewReliableSend(connID, enk)
@@ -938,16 +942,17 @@ func (s *Server) udpReadLoop(uc *net.UDPConn, listenAddr, targetAddr string, key
 			continue
 		}
 		sc = &ServerConn{
-			id:         connID,
-			proto:      "udp",
-			udpSock:    uc,
-			udpRemote:  ra,
-			udpSessKey: sessKey,
-			targetAddr: targetAddr,
-			keyHash:    keyHash,
-			clientID:   clientID,
-			routeKey:   routeKey,
-			ready:      make(chan struct{}),
+			id:           connID,
+			proto:        "udp",
+			udpSock:      uc,
+			udpRemote:    ra,
+			udpSessKey:   sessKey,
+			listenMapKey: mapKey,
+			targetAddr:   targetAddr,
+			keyHash:      keyHash,
+			clientID:     clientID,
+			routeKey:     routeKey,
+			ready:        make(chan struct{}),
 		}
 		enk := s.makeEnqueueRoute(routeKey)
 		sc.reliSend = NewReliableSend(connID, enk)
