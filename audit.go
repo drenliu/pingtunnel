@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+const (
+	// auditRateMaxEntries caps unique rate-limit keys so an unauthenticated
+	// invalid-key flood (random KeyHash / source addr) cannot grow auditRate without bound.
+	auditRateMaxEntries = 4096
+)
+
 var (
 	auditFile    *os.File
 	auditMu      sync.Mutex
@@ -36,12 +42,16 @@ func InitAudit(path string) error {
 
 func CloseAudit() {
 	auditMu.Lock()
-	defer auditMu.Unlock()
 	if auditFile != nil {
 		auditFile.Close()
 		auditFile = nil
 	}
 	auditEnabled = false
+	auditMu.Unlock()
+
+	auditRateMu.Lock()
+	auditRate = make(map[string]time.Time)
+	auditRateMu.Unlock()
 }
 
 func Audit(event string, fields map[string]string) {
@@ -81,9 +91,34 @@ func AuditRateLimited(rateKey, event string, fields map[string]string, interval 
 		auditRateMu.Unlock()
 		return
 	}
+	if !ok && len(auditRate) >= auditRateMaxEntries {
+		pruneAuditRateLocked(now, interval)
+	}
+	if !ok && len(auditRate) >= auditRateMaxEntries {
+		// Sustained unique-key flood: refuse to grow the map (avoids OOM).
+		// Skip the audit line as well — writing once per unique attacker key
+		// would still be an unbounded disk/CPU DoS under the same flood.
+		auditRateMu.Unlock()
+		return
+	}
 	auditRate[rateKey] = now
 	auditRateMu.Unlock()
 	Audit(event, fields)
+}
+
+func pruneAuditRateLocked(now time.Time, interval time.Duration) {
+	for k, t := range auditRate {
+		if now.Sub(t) >= interval {
+			delete(auditRate, k)
+		}
+	}
+}
+
+// auditRateSize returns the number of tracked rate-limit keys (tests only).
+func auditRateSize() int {
+	auditRateMu.Lock()
+	defer auditRateMu.Unlock()
+	return len(auditRate)
 }
 
 func hashPrefix(h [16]byte) string {
