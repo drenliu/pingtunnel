@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,7 +134,9 @@ func (m *Manager) flushTraffic() {
 	}
 	m.trafficMu.Unlock()
 	if changed {
-		m.saveLocked()
+		if err := m.saveLocked(); err != nil {
+			log.Printf("[manager] traffic flush save: %v", err)
+		}
 	}
 }
 
@@ -187,6 +190,8 @@ func (m *Manager) Save() error {
 	return m.saveLocked()
 }
 
+// saveLocked persists config via temp file + rename so a crash or write error
+// cannot leave a truncated pingtunnel.json (os.WriteFile uses O_TRUNC in place).
 func (m *Manager) saveLocked() error {
 	if m.path == "" {
 		return nil
@@ -196,7 +201,41 @@ func (m *Manager) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.path, data, 0600)
+	dir := filepath.Dir(m.path)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, ".pingtunnel-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, m.path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 func (m *Manager) rebuildIndex() {

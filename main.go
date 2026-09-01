@@ -85,15 +85,16 @@ func main() {
 
 		mgr := NewManager("pingtunnel.json")
 		if err := mgr.Load(); err != nil {
-			log.Printf("[main] config load: %v (starting fresh)", err)
+			// Refuse to boot empty after a corrupt/truncated config — starting fresh
+			// would permanently discard keys/rules that may still be recoverable.
 			Audit("config.load", map[string]string{"result": "error", "detail": err.Error()})
-		} else {
-			Audit("config.load", map[string]string{
-				"result":    "ok",
-				"path":      "pingtunnel.json",
-				"key_count": fmt.Sprintf("%d", len(mgr.GetKeys())),
-			})
+			log.Fatalf("[main] config load: %v (refusing to start; restore or fix pingtunnel.json)", err)
 		}
+		Audit("config.load", map[string]string{
+			"result":    "ok",
+			"path":      "pingtunnel.json",
+			"key_count": fmt.Sprintf("%d", len(mgr.GetKeys())),
+		})
 
 		srvT := strings.ToLower(strings.TrimSpace(*transport))
 		if srvT == "" {
