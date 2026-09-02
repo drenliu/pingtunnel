@@ -412,6 +412,15 @@ func (s *Server) handlePacket(pkt *TunnelPacket, from net.Addr, transport string
 		s.handleSocksDial(pkt, from)
 	case CmdSocksRegister:
 		s.handleSocksRegister(pkt, from, transport)
+	case CmdPing:
+		// DNS path-MTU / EDNS probing: echo padded Pings so the client can verify
+		// that a response of this size fits the path (request-only probes are insufficient).
+		if normalizeClientTransport(transport) == "dns" && len(pkt.Data) > 0 {
+			s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{
+				Cmd:  CmdPing,
+				Data: append([]byte(nil), pkt.Data...),
+			})
+		}
 	}
 }
 
