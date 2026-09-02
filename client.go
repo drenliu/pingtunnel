@@ -674,7 +674,11 @@ func (c *Client) dnsProbeRoundTrip(qname string, udpSize uint16) bool {
 	if c.tunConn == nil || c.tunPeer == nil {
 		return false
 	}
-	dataLen := maxTunnelPayloadForDNSRequest(qname, udpSize)
+	// Probe the response budget: server→client CmdData is packed into DNS answers,
+	// which are larger than queries. Padding to the request max made tiny Ping
+	// replies look like success even when a real response of this EDNS size cannot
+	// fit the path (or even the DNS encoding overhead).
+	dataLen := maxTunnelPayloadForDNSResponse(qname, udpSize)
 	pkt := &TunnelPacket{
 		Magic:    MagicRequest,
 		KeyHash:  c.key,
@@ -713,6 +717,11 @@ func (c *Client) dnsProbeRoundTrip(qname string, udpSize uint16) bool {
 		dec, err := DecodeTunnelPacket(payload)
 		if err != nil || dec.Magic != MagicResponse || dec.KeyHash != c.key || dec.ClientID != c.clientID {
 			continue
+		}
+		// Require an echoed payload of the probe size. A tiny default Ping reply
+		// only proves the request got through — not that responses this large work.
+		if len(dec.Data) < dataLen {
+			return false
 		}
 		return true
 	}
