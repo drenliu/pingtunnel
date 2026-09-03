@@ -21,6 +21,11 @@ import (
 // icmpClientHeartbeatTTL: if no ICMP from a tunnel key for this long, treat client as offline.
 const icmpClientHeartbeatTTL = 45 * time.Second
 
+// maxDNSForwards caps concurrent transparent-proxy goroutines. Without a cap,
+// a flood of non-tunnel QNAMEs to -dns-addr (with -dns-upstream set) spawns
+// unbounded forwardDNSQuery goroutines and can OOM the process.
+const maxDNSForwards = 256
+
 type Server struct {
 	manager *Manager
 	// At most one of these may be nil. Both may be set when the server uses ICMP+DNS.
@@ -31,6 +36,9 @@ type Server struct {
 	dnsAddr     string
 	dnsQName    string
 	dnsUpstream string // non-tunnel QNAME queries are forwarded here when set
+
+	// dnsForwardSem limits concurrent upstream DNS forwards (transparent proxy).
+	dnsForwardSem chan struct{}
 
 	dnsRouteUDPSize   map[string]uint16 // routeKey -> client EDNS UDP payload size
 	dnsRouteUDPSizeMu sync.Mutex
@@ -111,6 +119,7 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dn
 		dnsAddr:           da,
 		dnsQName:          qn,
 		dnsUpstream:       strings.TrimSpace(dnsUpstream),
+		dnsForwardSem:     make(chan struct{}, maxDNSForwards),
 		dnsRouteUDPSize:   make(map[string]uint16),
 		sendQueues:        make(map[string]chan *TunnelPacket),
 		ruleTunnelClients: make(map[string]*ruleTunnelState),
@@ -345,7 +354,7 @@ func (s *Server) dnsReadLoop(c net.PacketConn) {
 			if s.dnsUpstream != "" {
 				reqCopy := make([]byte, n)
 				copy(reqCopy, buf[:n])
-				go forwardDNSQuery(s.dnsUpstream, c, reqCopy, addr)
+				s.startDNSForward(c, reqCopy, addr)
 			}
 			continue
 		}
@@ -391,6 +400,31 @@ func (s *Server) dnsReadLoop(c net.PacketConn) {
 		}
 		_, _ = c.WriteTo(dnsOut, addr)
 		atomic.AddUint64(&s.stats.tunOut, 1)
+	}
+}
+
+// startDNSForward runs forwardDNSQuery in a goroutine if under the concurrency
+// cap; otherwise the query is dropped. Prevents OOM from floods of non-tunnel
+// QNAMEs when -dns-upstream is enabled.
+func (s *Server) startDNSForward(c net.PacketConn, req []byte, clientAddr net.Addr) bool {
+	if s == nil || s.dnsUpstream == "" || c == nil || len(req) < 12 || clientAddr == nil {
+		return false
+	}
+	sem := s.dnsForwardSem
+	if sem == nil {
+		go forwardDNSQuery(s.dnsUpstream, c, req, clientAddr)
+		return true
+	}
+	select {
+	case sem <- struct{}{}:
+		upstream := s.dnsUpstream
+		go func() {
+			defer func() { <-sem }()
+			forwardDNSQuery(upstream, c, req, clientAddr)
+		}()
+		return true
+	default:
+		return false
 	}
 }
 
