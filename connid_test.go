@@ -2,6 +2,7 @@ package main
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -55,6 +56,77 @@ func TestAllocConnIDConcurrentUnique(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("ConnID %d allocated %d times", id, count)
 		}
+	}
+}
+
+func TestAllocConnIDSkipsLiveIDsAfterWrap(t *testing.T) {
+	s := NewServer(NewManager(""), false, "dns", ":0", "c.pingt.local", "")
+	defer s.Close()
+
+	live := &ServerConn{id: 1, ready: make(chan struct{}), closed: 1}
+	s.mu.Lock()
+	s.connections[1] = live
+	s.mu.Unlock()
+
+	// Next Add overflows into the SOCKS space, wraps to 0, then yields 1 — which is live.
+	atomic.StoreUint32(&s.nextConnID, socksConnIDBase-1)
+
+	id := s.allocConnID()
+	if id == 1 {
+		t.Fatal("allocConnID reused live ConnID 1 after wraparound")
+	}
+	if id == 0 || id >= socksConnIDBase {
+		t.Fatalf("allocConnID returned %d; must stay in [1, %d)", id, socksConnIDBase)
+	}
+
+	s.mu.RLock()
+	got := s.connections[1]
+	s.mu.RUnlock()
+	if got != live {
+		t.Fatal("live connections[1] entry was replaced during wrap alloc")
+	}
+}
+
+func TestAllocConnIDLockedSkipsLiveIDsAfterWrap(t *testing.T) {
+	s := NewServer(NewManager(""), false, "dns", ":0", "c.pingt.local", "")
+	defer s.Close()
+
+	live := &ServerConn{id: 1, ready: make(chan struct{}), closed: 1}
+	s.mu.Lock()
+	s.connections[1] = live
+	atomic.StoreUint32(&s.nextConnID, socksConnIDBase-1)
+	id := s.allocConnIDLocked()
+	if id == 1 {
+		s.mu.Unlock()
+		t.Fatal("allocConnIDLocked reused live ConnID 1 after wraparound")
+	}
+	if id == 0 || id >= socksConnIDBase {
+		s.mu.Unlock()
+		t.Fatalf("allocConnIDLocked returned %d; must stay in [1, %d)", id, socksConnIDBase)
+	}
+	// Simulate the UDP accept path: insert under the same lock.
+	s.connections[id] = &ServerConn{id: id, ready: make(chan struct{}), closed: 1}
+	if s.connections[1] != live {
+		s.mu.Unlock()
+		t.Fatal("locked wrap alloc overwrote live ConnID 1")
+	}
+	s.mu.Unlock()
+}
+
+func TestAllocConnIDSkipsMultipleLiveIDs(t *testing.T) {
+	s := NewServer(NewManager(""), false, "dns", ":0", "c.pingt.local", "")
+	defer s.Close()
+
+	s.mu.Lock()
+	for id := uint32(1); id <= 5; id++ {
+		s.connections[id] = &ServerConn{id: id, ready: make(chan struct{}), closed: 1}
+	}
+	s.mu.Unlock()
+	atomic.StoreUint32(&s.nextConnID, socksConnIDBase-1)
+
+	id := s.allocConnID()
+	if id <= 5 {
+		t.Fatalf("expected first free ID after live 1..5, got %d", id)
 	}
 }
 

@@ -124,9 +124,33 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dn
 	}
 }
 
-// allocConnID returns a ConnID in [1, socksConnIDBase). SOCKS dials use IDs >= socksConnIDBase;
-// mixing the two spaces overwrites entries in Server.connections / Client.connections.
+// allocConnID returns a ConnID in [1, socksConnIDBase) that is not already present in
+// s.connections. SOCKS dials use IDs >= socksConnIDBase; mixing the two spaces (or
+// reusing a still-live ID after nextConnID wrap) overwrites map entries and mixes streams.
+// Caller must not hold s.mu (uses RLock to probe liveness).
 func (s *Server) allocConnID() uint32 {
+	for {
+		id := s.nextServerConnID()
+		s.mu.RLock()
+		_, taken := s.connections[id]
+		s.mu.RUnlock()
+		if !taken {
+			return id
+		}
+	}
+}
+
+// allocConnIDLocked is allocConnID for callers that already hold s.mu for write (e.g. udpReadLoop).
+func (s *Server) allocConnIDLocked() uint32 {
+	for {
+		id := s.nextServerConnID()
+		if _, taken := s.connections[id]; !taken {
+			return id
+		}
+	}
+}
+
+func (s *Server) nextServerConnID() uint32 {
 	for {
 		id := atomic.AddUint32(&s.nextConnID, 1)
 		if id > 0 && id < socksConnIDBase {
@@ -826,13 +850,16 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 			continue
 		}
 
-		connID := s.allocConnID()
 		routeKey, clientID, ok := s.routeKeyForListener(keyHash, mapKey)
 		if !ok {
-			log.Printf("[server] conn %d: no active tunnel client for %s, rejecting %s", connID, listenAddr, tc.RemoteAddr())
+			log.Printf("[server] no active tunnel client for %s, rejecting %s", listenAddr, tc.RemoteAddr())
 			tc.Close()
 			continue
 		}
+
+		// Allocate+insert under the same lock so a wrapped ConnID cannot overwrite a live session.
+		s.mu.Lock()
+		connID := s.allocConnIDLocked()
 		sc := &ServerConn{
 			id:         connID,
 			proto:      "tcp",
@@ -849,8 +876,6 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 			func(data []byte) error { _, err := sc.tcpConn.Write(data); return err },
 			enk,
 		)
-
-		s.mu.Lock()
 		s.connections[connID] = sc
 		s.mu.Unlock()
 
@@ -929,7 +954,7 @@ func (s *Server) udpReadLoop(uc *net.UDPConn, listenAddr, targetAddr string, key
 			continue
 		}
 
-		connID := s.allocConnID()
+		connID := s.allocConnIDLocked()
 		mapKey := ListenerMapKey("udp", listenAddr)
 		routeKey, clientID, ok := s.routeKeyForListener(keyHash, mapKey)
 		if !ok {
