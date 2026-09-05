@@ -117,11 +117,7 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 	dialAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
 	ch := make(chan bool, 1)
-	connID := atomic.AddUint32(&c.nextSocksConn, 1) + socksConnIDBase
-
-	c.socksMu.Lock()
-	c.socksWait[connID] = ch
-	c.socksMu.Unlock()
+	connID := c.reserveSocksConnID(ch)
 
 	c.enqueue(&TunnelPacket{Cmd: CmdSocksDial, ConnID: connID, Data: []byte(dialAddr)})
 
@@ -167,3 +163,33 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 }
 
 const socksConnIDBase uint32 = 0x60000000
+
+// reserveSocksConnID picks a ConnID in the SOCKS space, skips IDs still used by a
+// live relay, and inserts ch into socksWait atomically. Plain
+// nextSocksConn+socksConnIDBase wraps into the port-forward space (< socksConnIDBase);
+// those IDs are rejected by the server, and a mistaken CmdClose for them would tear
+// down a live port-forward session on dual-mode clients.
+func (c *Client) reserveSocksConnID(ch chan bool) uint32 {
+	for {
+		n := atomic.AddUint32(&c.nextSocksConn, 1)
+		id := n + socksConnIDBase
+		if id < socksConnIDBase {
+			// uint32 wrap crossed into the server-assigned port-forward space.
+			continue
+		}
+		c.mu.RLock()
+		_, live := c.connections[id]
+		c.mu.RUnlock()
+		if live {
+			continue
+		}
+		c.socksMu.Lock()
+		if _, waiting := c.socksWait[id]; waiting {
+			c.socksMu.Unlock()
+			continue
+		}
+		c.socksWait[id] = ch
+		c.socksMu.Unlock()
+		return id
+	}
+}

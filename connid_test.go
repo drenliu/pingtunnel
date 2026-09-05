@@ -102,10 +102,11 @@ func TestSocksDialRejectsServerConnIDSpace(t *testing.T) {
 		t.Fatal("SOCKS dial with server-space ConnID overwrote an existing connection")
 	}
 
-	// A close response should be queued for the client.
+	// Must NOT queue CmdClose: the client would tear down a live port-forward with
+	// the same ConnID (dual-mode / wrap collision).
 	pkt := s.dequeueRoute(routeKey)
-	if pkt == nil || pkt.Cmd != CmdClose || pkt.ConnID != serverConnID {
-		t.Fatalf("expected CmdClose for rejected SOCKS dial, got %#v", pkt)
+	if pkt != nil && pkt.Cmd != CmdPing {
+		t.Fatalf("expected no control frame for rejected low-ID SOCKS dial, got %#v", pkt)
 	}
 }
 

@@ -565,22 +565,24 @@ func (s *Server) setupAckPayload() []byte {
 }
 
 func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {
+	if pkt.ConnID == 0 || len(pkt.Data) == 0 {
+		return
+	}
+	// SOCKS dial ConnIDs must use the high ID space; low IDs are server-assigned for
+	// port-forward. Never CmdClose a low ConnID: the client treats Close as teardown of
+	// connections[ConnID], so a rejection Close would kill a live port-forward session
+	// that shares that ID (dual-mode client after SOCKS ID wrap, or a confused dial).
+	if pkt.ConnID < socksConnIDBase {
+		log.Printf("[server] SOCKS dial conn %d rejected (ConnID below socks space)", pkt.ConnID)
+		return
+	}
 	if !s.socksDynamic {
 		log.Printf("[server] SOCKS dial conn %d rejected (socks-dynamic disabled)", pkt.ConnID)
 		s.enqueueForAddr(pkt.KeyHash, pkt.ClientID, from, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
 		return
 	}
-	if pkt.ConnID == 0 || len(pkt.Data) == 0 {
-		return
-	}
 	routeKey := s.queueKeyForAddr(pkt.KeyHash, pkt.ClientID, from)
 	if routeKey == "" {
-		return
-	}
-	// SOCKS dial ConnIDs must use the high ID space; low IDs are server-assigned for port-forward.
-	if pkt.ConnID < socksConnIDBase {
-		log.Printf("[server] SOCKS dial conn %d rejected (ConnID below socks space)", pkt.ConnID)
-		s.enqueueRoute(routeKey, &TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
 		return
 	}
 	target := normalizeSocksDialTarget(string(pkt.Data))
