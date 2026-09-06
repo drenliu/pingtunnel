@@ -48,6 +48,7 @@ type Client struct {
 	tunSeq      uint32
 	dnsUDPSize  uint32 // atomic: negotiated EDNS UDP payload size (DNS transport)
 	serverEpoch uint32 // atomic: last seen server boot epoch (detect restart)
+	dataSem     chan struct{}
 	mu          sync.RWMutex
 	closed      int32
 	done        chan struct{}
@@ -62,7 +63,8 @@ type ClientConn struct {
 	reliSend *ReliableSend
 	reliRecv *ReliableRecv
 
-	silentClose int32 // atomic: skip CmdClose notify (server restart session reset)
+	writeMu     sync.Mutex // serializes local writes from async CmdData handlers
+	silentClose int32      // atomic: skip CmdClose notify (server restart session reset)
 	idleMu      sync.Mutex
 	idleTimer   *time.Timer
 }
@@ -82,6 +84,7 @@ func NewClient(listenAddr, serverAddr, targetAddr, key, protocol, socksAddr, tra
 		pending:     make(map[uint32]bool),
 		socksWait:   make(map[uint32]chan bool),
 		sendQueue:   make(chan *TunnelPacket, 4096),
+		dataSem:     make(chan struct{}, maxConcurrentDataHandlers),
 		done:        make(chan struct{}),
 		setupDone:   make(chan struct{}),
 		setupFail:   make(chan struct{}),
@@ -381,7 +384,7 @@ func (c *Client) handlePacket(pkt *TunnelPacket) {
 	case CmdConnect:
 		go c.handleConnect(pkt)
 	case CmdData:
-		c.handleData(pkt)
+		c.dispatchData(pkt)
 	case CmdDataAck:
 		c.handleDataAck(pkt)
 	case CmdClose:
@@ -454,13 +457,7 @@ func (c *Client) handleConnect(pkt *TunnelPacket) {
 	cc := &ClientConn{id: pkt.ConnID, proto: c.protocol, tcpConn: conn}
 	cc.reliSend = NewReliableSend(pkt.ConnID, c.enqueue)
 	cc.reliRecv = NewReliableRecv(pkt.ConnID,
-		func(data []byte) error {
-			_, werr := conn.Write(data)
-			if werr == nil && c.protocol == "udp" {
-				cc.resetUDPIdle(c)
-			}
-			return werr
-		},
+		c.makeLocalDeliver(cc),
 		c.enqueue,
 	)
 
@@ -516,6 +513,21 @@ func (c *Client) readTarget(cc *ClientConn) {
 	}
 }
 
+func (c *Client) dispatchData(pkt *TunnelPacket) {
+	if atomic.LoadInt32(&c.closed) != 0 {
+		return
+	}
+	select {
+	case c.dataSem <- struct{}{}:
+		go func() {
+			defer func() { <-c.dataSem }()
+			c.handleData(pkt)
+		}()
+	default:
+		log.Printf("[client] data handlers saturated, dropping conn %d seq %d", pkt.ConnID, pkt.Seq)
+	}
+}
+
 func (c *Client) handleData(pkt *TunnelPacket) {
 	c.mu.RLock()
 	cc := c.connections[pkt.ConnID]
@@ -533,6 +545,26 @@ func (c *Client) handleData(pkt *TunnelPacket) {
 		cc.reliSend.Close()
 		cc.reliRecv.Close()
 		c.enqueue(&TunnelPacket{Cmd: CmdClose, ConnID: pkt.ConnID})
+	}
+}
+
+func (cc *ClientConn) writeLocal(data []byte) error {
+	cc.writeMu.Lock()
+	defer cc.writeMu.Unlock()
+	if cc.tcpConn == nil {
+		return fmt.Errorf("no local endpoint")
+	}
+	_, err := cc.tcpConn.Write(data)
+	return err
+}
+
+func (c *Client) makeLocalDeliver(cc *ClientConn) func([]byte) error {
+	return func(data []byte) error {
+		err := cc.writeLocal(data)
+		if err == nil && cc.proto == "udp" {
+			cc.resetUDPIdle(c)
+		}
+		return err
 	}
 }
 

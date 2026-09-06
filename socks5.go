@@ -153,7 +153,7 @@ func (c *Client) serveSOCKSConn(tc net.Conn) {
 	cc := &ClientConn{id: connID, proto: "tcp", tcpConn: tc}
 	cc.reliSend = NewReliableSend(connID, c.enqueue)
 	cc.reliRecv = NewReliableRecv(connID,
-		func(data []byte) error { _, werr := tc.Write(data); return werr },
+		c.makeLocalDeliver(cc),
 		c.enqueue,
 	)
 
