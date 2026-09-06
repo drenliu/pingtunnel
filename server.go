@@ -53,6 +53,10 @@ type Server struct {
 	connections  map[uint32]*ServerConn
 	nextConnID   uint32
 
+	// Caps concurrent CmdData handlers so a stuck local Write cannot freeze the
+	// ICMP/DNS read loop (and so a flood cannot spawn unbounded goroutines).
+	dataSem chan struct{}
+
 	mu        sync.RWMutex
 	closed    int32
 	done      chan struct{}
@@ -83,6 +87,8 @@ type ServerConn struct {
 	reliSend   *ReliableSend
 	reliRecv   *ReliableRecv
 
+	writeMu sync.Mutex // serializes local TCP/UDP writes from async CmdData handlers
+
 	udpMu      sync.Mutex
 	udpReady   bool
 	udpPending [][]byte
@@ -90,6 +96,9 @@ type ServerConn struct {
 	idleMu    sync.Mutex
 	idleTimer *time.Timer
 }
+
+// maxConcurrentDataHandlers limits in-flight CmdData delivery goroutines.
+const maxConcurrentDataHandlers = 256
 
 type ruleTunnelState struct {
 	addr      net.Addr
@@ -118,6 +127,7 @@ func NewServer(mgr *Manager, socksDynamic bool, transport, dnsAddr, dnsQName, dn
 		listenersUDP:      make(map[string]*net.UDPConn),
 		udpSessions:       make(map[string]*ServerConn),
 		connections:       make(map[uint32]*ServerConn),
+		dataSem:           make(chan struct{}, maxConcurrentDataHandlers),
 		done:              make(chan struct{}),
 		bootEpoch:         bootEpoch,
 		nextConnID:        bootEpoch, // avoid connID reuse across restarts (stale CmdClose); kept < socksConnIDBase
@@ -403,7 +413,7 @@ func (s *Server) handlePacket(pkt *TunnelPacket, from net.Addr, transport string
 	case CmdConnectAck:
 		s.handleConnectAck(pkt, from)
 	case CmdData:
-		s.handleData(pkt, from)
+		s.dispatchData(pkt, from)
 	case CmdDataAck:
 		s.handleDataAck(pkt, from)
 	case CmdClose:
@@ -484,6 +494,25 @@ func (s *Server) handleConnectAck(pkt *TunnelPacket, from net.Addr) {
 	if sc != nil && s.matchRoute(sc, from) {
 		sc.readyOnce.Do(func() { close(sc.ready) })
 		log.Printf("[server] conn %d: client ready", pkt.ConnID)
+	}
+}
+
+// dispatchData runs handleData off the ICMP/DNS read loop. Local TCP Writes can
+// block indefinitely when the accept-side peer stops reading; doing that inline
+// froze every tunnel client on the transport. Cap concurrency so floods cannot
+// spawn unbounded goroutines; when saturated, drop without ACKing so the peer retransmits.
+func (s *Server) dispatchData(pkt *TunnelPacket, from net.Addr) {
+	if atomic.LoadInt32(&s.closed) != 0 {
+		return
+	}
+	select {
+	case s.dataSem <- struct{}{}:
+		go func() {
+			defer func() { <-s.dataSem }()
+			s.handleData(pkt, from)
+		}()
+	default:
+		log.Printf("[server] data handlers saturated, dropping conn %d seq %d", pkt.ConnID, pkt.Seq)
 	}
 }
 
@@ -618,7 +647,7 @@ func (s *Server) handleSocksDial(pkt *TunnelPacket, from net.Addr) {
 	enk := s.makeEnqueueRoute(routeKey)
 	sc.reliSend = NewReliableSend(connID, enk)
 	sc.reliRecv = NewReliableRecv(connID,
-		func(data []byte) error { _, e := conn.Write(data); return e },
+		s.makeLocalDeliver(sc),
 		enk,
 	)
 
@@ -846,7 +875,7 @@ func (s *Server) startTCPListener(listenAddr, targetAddr string, keyHash [16]byt
 		enk := s.makeEnqueueRoute(routeKey)
 		sc.reliSend = NewReliableSend(connID, enk)
 		sc.reliRecv = NewReliableRecv(connID,
-			func(data []byte) error { _, err := sc.tcpConn.Write(data); return err },
+			s.makeLocalDeliver(sc),
 			enk,
 		)
 
@@ -952,13 +981,7 @@ func (s *Server) udpReadLoop(uc *net.UDPConn, listenAddr, targetAddr string, key
 		enk := s.makeEnqueueRoute(routeKey)
 		sc.reliSend = NewReliableSend(connID, enk)
 		sc.reliRecv = NewReliableRecv(connID,
-			func(data []byte) error {
-				_, werr := sc.udpSock.WriteTo(data, sc.udpRemote)
-				if werr == nil {
-					sc.resetUDPIdle(s)
-				}
-				return werr
-			},
+			s.makeLocalDeliver(sc),
 			enk,
 		)
 		s.udpSessions[sessKey] = sc
@@ -1420,5 +1443,31 @@ func (sc *ServerConn) stopIdleTimer() {
 	if sc.idleTimer != nil {
 		sc.idleTimer.Stop()
 		sc.idleTimer = nil
+	}
+}
+
+// writeLocal serializes writes to the accept-side TCP/UDP socket. CmdData may be
+// delivered from multiple goroutines after dispatchData.
+func (sc *ServerConn) writeLocal(data []byte) error {
+	sc.writeMu.Lock()
+	defer sc.writeMu.Unlock()
+	if sc.tcpConn != nil {
+		_, err := sc.tcpConn.Write(data)
+		return err
+	}
+	if sc.udpSock != nil && sc.udpRemote != nil {
+		_, err := sc.udpSock.WriteTo(data, sc.udpRemote)
+		return err
+	}
+	return errors.New("no local endpoint")
+}
+
+func (s *Server) makeLocalDeliver(sc *ServerConn) func([]byte) error {
+	return func(data []byte) error {
+		err := sc.writeLocal(data)
+		if err == nil && sc.proto == "udp" {
+			sc.resetUDPIdle(s)
+		}
+		return err
 	}
 }
